@@ -1,0 +1,4 @@
+The bundled cacert.pem is Mozilla's CA certificate store converted to PEM by the curl project.
+Source: https://curl.se/docs/caextract.html
+License: Mozilla Public License 2.0 (https://www.mozilla.org/MPL/2.0/)
+Update command and expected digest are documented in docs/DEPENDENCIES.md.

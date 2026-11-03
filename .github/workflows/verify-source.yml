@@ -1,0 +1,28 @@
+name: Verify source contracts
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up pinned .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 8.0.300
+
+      - name: Verify download policy
+        run: dotnet run --project tests/DownloadPolicy.ContractTests/DownloadPolicy.ContractTests.csproj --configuration Release
+
+      - name: Verify Unity asset references
+        run: dotnet run --project tests/UnityAssetReferences.ContractTests/UnityAssetReferences.ContractTests.csproj --configuration Release

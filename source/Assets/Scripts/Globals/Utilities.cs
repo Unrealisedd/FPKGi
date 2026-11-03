@@ -574,27 +574,9 @@ public class Utilities : MonoBehaviour
                 {
                     if (contentType == ContentType.Homebrew)
                     {
-                        string pkgUrl = updateDownloadUrl;
-                        string pkgSize = await DownloadAsBytes(updateSizeUrl);
-
                         var homebrewJson = new
                         {
-                            DATA = new Dictionary<string, object>
-                            {
-                                {
-                                    pkgUrl, new
-                                    {
-                                        title_id = "PKGI13337",
-                                        region = "ALL",
-                                        name = "FPKGi",
-                                        version = UI.FormatVersion(version),
-                                        release = "12-25-2024",
-                                        size = pkgSize ?? "82182144",
-                                        min_fw = "4.50+ / PS5",
-                                        cover_url = "https://pkg-zone.com/images/PKGI13337/cover.png"
-                                    }
-                                }
-                            }
+                            DATA = new Dictionary<string, object>()
                         };
 
                         string jsonString = JsonConvert.SerializeObject(homebrewJson, Formatting.Indented);
@@ -812,32 +794,99 @@ public class Utilities : MonoBehaviour
         {
             if (string.IsNullOrWhiteSpace(path)) return;
 
-            path = Path.GetFullPath(path);
-            string directoryPath = Path.HasExtension(path) ? Path.GetDirectoryName(path) : path;
+            string fullPath = Path.GetFullPath(path);
+            if (Directory.Exists(fullPath)) return;
 
-            if (DoesPathExist(directoryPath)) return;
+            Directory.CreateDirectory(fullPath);
+            Print(LogType.Log, $"Created directory: {fullPath}");
+        }
 
-            Stack<string> toCreate = new Stack<string>();
+        public static void WriteAllTextAtomic(string filePath, string content)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+                throw new ArgumentException("File path is required.", nameof(filePath));
 
-            while (!string.IsNullOrEmpty(directoryPath) && !DoesPathExist(directoryPath))
+            string fullPath = Path.GetFullPath(filePath);
+            string parent = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(parent))
+                Directory.CreateDirectory(parent);
+
+            string temporaryPath = fullPath + ".tmp";
+            string backupPath = fullPath + ".bak";
+            File.WriteAllText(temporaryPath, content);
+
+            if (!File.Exists(fullPath))
             {
-                toCreate.Push(directoryPath);
-                directoryPath = Path.GetDirectoryName(directoryPath);
+                File.Move(temporaryPath, fullPath);
+                return;
             }
 
-            while (toCreate.Count > 0)
+            try
             {
-                string dirToCreate = toCreate.Pop();
-                Directory.CreateDirectory(dirToCreate);
-                Print(LogType.Log, $"Created directory: {dirToCreate}");
+                File.Replace(temporaryPath, fullPath, backupPath);
+                if (File.Exists(backupPath))
+                    File.Delete(backupPath);
+            }
+            catch (PlatformNotSupportedException)
+            {
+                ReplaceWithBackup(fullPath, temporaryPath, backupPath);
+            }
+            catch (NotImplementedException)
+            {
+                ReplaceWithBackup(fullPath, temporaryPath, backupPath);
+            }
+            catch (IOException)
+            {
+                ReplaceWithBackup(fullPath, temporaryPath, backupPath);
             }
         }
 
-        public static bool IsValidPackageFile(string filePath)  // shoutout LM
+        public static bool RecoverAtomicFile(string filePath)
         {
-            if (isConsole == false)
-                return true;
+            if (string.IsNullOrWhiteSpace(filePath))
+                throw new ArgumentException("File path is required.", nameof(filePath));
 
+            try
+            {
+                AtomicRecoverySource source = AtomicFileRecovery.Recover(filePath);
+                if (source == AtomicRecoverySource.Backup ||
+                    source == AtomicRecoverySource.Temporary)
+                {
+                    Print(LogType.Warning,
+                        $"Recovered interrupted atomic write from the {source.ToString().ToLowerInvariant()} file.");
+                }
+                return source != AtomicRecoverySource.None;
+            }
+            catch (Exception ex)
+            {
+                Print(LogType.Error,
+                    $"Could not recover interrupted atomic write for '{filePath}': {ex.Message}");
+                return false;
+            }
+        }
+
+
+        private static void ReplaceWithBackup(string fullPath, string temporaryPath, string backupPath)
+        {
+            if (File.Exists(backupPath))
+                File.Delete(backupPath);
+
+            File.Move(fullPath, backupPath);
+            try
+            {
+                File.Move(temporaryPath, fullPath);
+                File.Delete(backupPath);
+            }
+            catch
+            {
+                if (!File.Exists(fullPath) && File.Exists(backupPath))
+                    File.Move(backupPath, fullPath);
+                throw;
+            }
+        }
+
+        public static bool IsValidPackageFile(string filePath)
+        {
             byte[] ExpectedMagic = { 0x7F, (byte)'C', (byte)'N', (byte)'T' };
 
             if (!DoesPathExist(filePath))
@@ -1050,11 +1099,17 @@ public class Utilities : MonoBehaviour
         public static string DecryptBase64(string encodedString)
         {
             if (IsValidURI(encodedString)) return encodedString;
+            if (string.IsNullOrWhiteSpace(encodedString)) return string.Empty;
 
-            byte[] decodedBytes = Convert.FromBase64String(encodedString);
-            string decodedString = Encoding.UTF8.GetString(decodedBytes);
-
-            return decodedString;
+            try
+            {
+                byte[] decodedBytes = Convert.FromBase64String(encodedString);
+                return Encoding.UTF8.GetString(decodedBytes);
+            }
+            catch (FormatException)
+            {
+                return encodedString;
+            }
         }
 
         public static bool IsValidImageType(string url)

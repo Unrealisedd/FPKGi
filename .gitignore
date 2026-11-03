@@ -6,6 +6,8 @@
 /source/obj
 /source/Temp
 /source/UnityPackageManager
+/tests/**/bin/
+/tests/**/obj/
+/graphify-out/
 
-*.meta
 *.pkg

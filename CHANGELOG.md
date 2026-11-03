@@ -1,5 +1,34 @@
 # FPKGi - Nightly Changelog
 
+<details open>
+<summary>[ v1.11.0 Build: 500 ] maintained FW14 qualification build</summary>
+
+### Compatibility
+- Replaces unbounded sandbox/module startup waits with a bounded, visible native-service result.
+- Records firmware and exact native initialization failures for the PS4 14.00 hardware matrix.
+- Keeps the FW14 claim experimental until the documented real-console scenarios pass.
+
+### Download management
+- Persists queue metadata/state across relaunch and retains failed entries for retry.
+- Uses one owned native direct transfer; cancellation reaches a terminal state before reset/restart.
+- Preserves resumable partial files on transient errors and adds bounded exponential retries.
+- Validates canonical storage roots and package identity, preflights known free space, and prevents catalog path traversal.
+- Requires exact package size and supports optional SHA-256 verification before installation.
+- Authenticates HTTPS with a bundled Mozilla CA store and rejects cross-scheme redirect chains.
+- Treats BGFT registration as `submitted`, not installed, and propagates registration errors.
+- Journals BGFT submission intent so interruption blocks an unknown task outcome instead of resubmitting it.
+- Journals local installation intent/completion so relaunch blocks unknown outcomes instead of submitting twice.
+- Rejects unsupported ZIP responses without deleting the downloaded evidence.
+
+### Convenience and maintenance
+- Restores queue entries from metadata snapshots even when a catalog is unavailable.
+- Keeps configured LAN/web catalogs enabled when unrelated remote services are offline.
+- Restores canonical Unity asset metadata, verifies serialized references, and adds deterministic host policy tests, dependency provenance, download documentation, and a FW14 qualification matrix.
+- Recovers interrupted atomic config/queue writes, fails closed when recovery artifacts cannot be restored, and blocks stale/invalid metadata before it can displace valid queue work.
+- Disables the upstream self-update path until this maintained branch has a hardware-qualified release; first-run homebrew catalogs are empty instead of advertising an unqualified package.
+
+<br></details>
+
 <details>
 <summary>[ v1.10.0-release Build: 437 ] from Jan 27th, 2026</summary>
 

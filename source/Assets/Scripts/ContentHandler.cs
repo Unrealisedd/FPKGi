@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.UI;
@@ -267,9 +266,12 @@ public class ContentHandler : MonoBehaviour
         private static Dictionary<string, Font> fontCache = new Dictionary<string, Font>();
         private static Dictionary<string, int> cachedCounts = new Dictionary<string, int>();
         private static Dictionary<string, List<KeyValuePair<string, GameContent>>> cachedItemsList = new Dictionary<string, List<KeyValuePair<string, GameContent>>>();
+        private static Dictionary<PKG, GameContent> displayedContent =
+            new Dictionary<PKG, GameContent>();
 
         public static void ClearDisplayedItems()
         {
+            displayedContent.Clear();
             foreach (var pkg in Content.PKGs)
             {
                 if (pkg == null) continue;
@@ -280,7 +282,6 @@ public class ContentHandler : MonoBehaviour
                 UI.ChangeText(pkg.Size, string.Empty);
             }
         }
-        [DllImport("UnityOrbisBridge")] public static extern long GetRemoteFileSize(string url);
 
         public static void DisplayItems(IEnumerable<KeyValuePair<string, GameContent>> items)
         {
@@ -288,9 +289,7 @@ public class ContentHandler : MonoBehaviour
             int currentIndex = 0;
             var displayedTitles = new HashSet<string>();
             var duplicateTitles = new HashSet<string>();
-            var validRegions = new HashSet<string> { "asia", "eur", "jap", "usa", "all" };
             var contentHandler = FindObjectOfType<ContentHandler>();
-            var invalidFileNameChars = Path.GetInvalidFileNameChars();
 
             var arabicFont = contentHandler?.Arabic;
             var multiFont = contentHandler?.Multi;
@@ -311,7 +310,8 @@ public class ContentHandler : MonoBehaviour
 
                     item.Value.min_fw = string.IsNullOrEmpty(item.Value.min_fw) ? "?.??" : item.Value.min_fw;
                     item.Value.release = string.IsNullOrEmpty(item.Value.release) ? "UNKNOWN" : item.Value.release;
-                    item.Value.version = item.Value.version ?? "?.??";
+                    string displayVersion = string.IsNullOrEmpty(item.Value.version)
+                        ? "?.??" : item.Value.version;
 
                     bool isFirstOccurrence = !displayedTitles.Contains(item.Value.name);
                     if (!isFirstOccurrence)
@@ -320,17 +320,17 @@ public class ContentHandler : MonoBehaviour
                         displayedTitles.Add(item.Value.name);
 
                     string titleToDisplay = duplicateTitles.Contains(item.Value.name)
-                        ? $"{item.Value.name} [v{item.Value.version}]" : item.Value.name;
+                        ? $"{item.Value.name} [v{displayVersion}]" : item.Value.name;
 
                     UpdatePackageUI(package, item.Value.title_id, region, titleToDisplay, item.Value.size);
-                 // UpdatePackageUI(package, item.Value.title_id, region, titleToDisplay, GetRemoteFileSize(item.Key).ToString());
+                    displayedContent[package] = item.Value;
+                    UpdateDownloadStatus(package, item.Value);
 
                     SetFontByTextCached(ref package.Title, titleToDisplay, arabicFont, multiFont);
 
                     currentIndex++;
                 }
 
-                UpdateDownloadStatus(Content.PKGs[currentIndex - 1], invalidFileNameChars);
             }
         }
 
@@ -414,39 +414,55 @@ public class ContentHandler : MonoBehaviour
                 return multiFont;
         }
 
-        private static string SanitizeFilename(string filename, char[] invalidChars)
+        private static void UpdateDownloadStatus(PKG package, GameContent content)
         {
-            if (string.IsNullOrEmpty(filename))
-                return string.Empty;
+            if (package == null || package.Downloaded == null) return;
 
-            var sb = new System.Text.StringBuilder(filename);
-            foreach (char invalidChar in invalidChars)
-                sb.Replace(invalidChar.ToString(), string.Empty);
-
-            string result = sb.ToString();
-            return result.Length > 255 ? result.Substring(0, 255) : result;
-        }
-
-        private static void UpdateDownloadStatus(PKG package, char[] invalidFileNameChars)
-        {
             package.Downloaded.gameObject.SetActive(false);
             UI.ChangeText(package.Downloaded, "");
             package.Downloaded.color = Color.white;
 
-            string sanitizedFilename = SanitizeFilename(package.Title.text, invalidFileNameChars);
-            var packagePath = Path.Combine(downloadPath, $"[{package.TitleID.text}] {sanitizedFilename}.pkg");
+            if (content == null)
+                return;
 
-            bool isFullyDownloaded = File.Exists(packagePath) && IO.IsValidPackageFile(packagePath);
-            bool isPartiallyDownloaded = !isFullyDownloaded && File.Exists($"{packagePath}.resume");
-            bool isInstalled = isConsole && UOB.CheckIfAppExists(package.TitleID.text);
+            try
+            {
+                DownloadPolicy.NormalizeTitleId(content.title_id);
+            }
+            catch (Exception)
+            {
+                return;
+            }
 
+            bool isInstalled = isConsole && UOB.CheckIfAppExists(content.title_id);
             if (isInstalled)
             {
                 package.Downloaded.gameObject.SetActive(true);
                 UI.ChangeText(package.Downloaded, "x");
                 package.Downloaded.color = blueish;
+                return;
             }
-            else if (isFullyDownloaded)
+
+            PackagePaths paths;
+            ulong expectedSize;
+            try
+            {
+                expectedSize = DownloadPolicy.ParseExpectedSize(content.size);
+                paths = DownloadPolicy.BuildPackagePaths(downloadPath, isConsole,
+                    content.title_id, content.version, content.name);
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            PackageVerification verification =
+                DownloadPolicy.VerifyPackage(paths.FinalPath, expectedSize, null);
+            bool isFullyDownloaded = verification.IsValid;
+            bool isPartiallyDownloaded =
+                !isFullyDownloaded && File.Exists(paths.ResumePath);
+
+            if (isFullyDownloaded)
             {
                 package.Downloaded.gameObject.SetActive(true);
                 UI.ChangeText(package.Downloaded, "+");
@@ -458,20 +474,15 @@ public class ContentHandler : MonoBehaviour
                 UI.ChangeText(package.Downloaded, "o");
                 package.Downloaded.color = redish;
             }
+
         }
 
         public static void UpdateAllDownloadStatuses()
         {
-            if (Content.PKGs == null || Content.PKGs.Count == 0) return;
-
-            var invalidFileNameChars = Path.GetInvalidFileNameChars();
-
-            foreach (var pkg in Content.PKGs)
+            foreach (KeyValuePair<PKG, GameContent> displayed in displayedContent.ToList())
             {
-                if (pkg == null || string.IsNullOrEmpty(pkg.TitleID.text) || string.IsNullOrEmpty(pkg.Title.text))
-                    continue;
-
-                UpdateDownloadStatus(pkg, invalidFileNameChars);
+                if (displayed.Key != null)
+                    UpdateDownloadStatus(displayed.Key, displayed.Value);
             }
         }
 
@@ -775,8 +786,6 @@ public class ContentHandler : MonoBehaviour
         {
             if (Content.PKGs == null || Content.PKGs.Count == 0) return;
 
-            // Update install state for all displayed packages every frame
-            UpdateAllDownloadStatuses();
 
             int pageIndex = contentScroll % itemsPerPage;
             currentPkg = Content.PKGs[pageIndex];

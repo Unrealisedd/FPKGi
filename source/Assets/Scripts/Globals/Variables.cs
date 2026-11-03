@@ -4,8 +4,8 @@ using UnityEngine.UI;
 
 public class Variables
 {
-    public static float version = 1.100f;
-    public static int buildNumber = 0437;
+    public static float version = 1.110f;
+    public static int buildNumber = 0500;
 
     public static bool? GoldHEN = null;
     public static bool? etaHEN = null;
@@ -13,12 +13,11 @@ public class Variables
     public static bool? loadedOffline = null;
     public static bool? updateAvailable = null;
     public static float? latestVersion = null;
+    public static string firmwareVersion = "unknown";
+    public static string startupError = null;
 
     public static string updateVersionUrl =
         "https://gist.githubusercontent.com/ItsJokerZz/05061df82bb31d500e7d0f89bfa0a221/raw/FPKGi_latest.version?cache-bust=1";
-
-    public static string updateReleaseUrl =
-        "https://gist.githubusercontent.com/ItsJokerZz/f1d4236d04bbbe0fbf47f1e12b5ab611/raw/FPKGi_latest.release?cache-bust=1";
 
     public static string updateSizeUrl =
         "https://gist.githubusercontent.com/ItsJokerZz/6e979e91d020bb574c66e74793b4201f/raw/FPKGi_latest.size?cache-bust=1";
@@ -26,13 +25,12 @@ public class Variables
     public static string updateHashUrl =
         "https://raw.githubusercontent.com/ItsJokerZz/FPKGi/refs/heads/release/HASH.md5?cache-bust=1";
 
-    public static string updateDownloadUrl => GoldHEN == true
-            ? "https://pkg-zone.com/download/ps4/PKGI13337/latest"
-            : "https://pkg-zone.com/download/ps5/PKGI13337/latest";
-
-    public static bool isConsole = Application.platform != RuntimePlatform.WindowsEditor;
+    public static bool isConsole = Application.platform == RuntimePlatform.PS4;
 
     public static readonly string iconPath = "/user/appmeta/PKGI13337/icon0.png";
+    public const int StartupTimeoutSeconds = 20;
+    public const ulong DownloadSpaceReserveBytes = 64UL * 1024UL * 1024UL;
+    public static readonly bool MaintainedUpdateChannelAvailable = false;
 
     #region Global Variabales
     public static Color blueish = new Color32(72, 142, 255, 255);
@@ -102,7 +100,10 @@ public class Variables
         deleteOnCancel = false,
         populateViaWeb = false,
         backgroundMusic = true,
-        enableUpdates = true;
+        enableUpdates = false;
+
+    public static int maxDownloadRetries = 3;
+    public static int retryBaseDelaySeconds = 2;
 
     public static Dictionary<string, string> ContentURLs = new Dictionary<string, string>
     {

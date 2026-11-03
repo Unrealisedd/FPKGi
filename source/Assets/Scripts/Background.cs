@@ -123,7 +123,9 @@ public class Background : MonoBehaviour
                     downloadPath,
                     installAfter,
                     deleteAfter,
-                    deleteOnCancel
+                    deleteOnCancel,
+                    maxRetries = maxDownloadRetries,
+                    retryBaseDelaySeconds
                 },
                 APPLICATION = new
                 {
@@ -172,13 +174,22 @@ public class Background : MonoBehaviour
         string jsonString = JsonConvert.SerializeObject(configJSON, Formatting.Indented);
         string configPath = Path.Combine(directoryPath, "config.json");
 
-        File.WriteAllText(configPath, jsonString);
+        IO.WriteAllTextAtomic(configPath, jsonString);
     }
 
     public static void HandleConfiguration()
     {
         string configPath = Path.Combine(directoryPath, "config.json");
 
+        IO.RecoverAtomicFile(configPath);
+        if (!File.Exists(configPath) &&
+            AtomicFileRecovery.HasRecoveryArtifacts(configPath))
+        {
+            startupError =
+                "Startup failed: interrupted configuration write could not be recovered.";
+            Print(LogType.Error, startupError);
+            return;
+        }
         if (!File.Exists(configPath))
         {
             Print(LogType.Log, "Creating JSON file: config.json");
@@ -187,33 +198,20 @@ public class Background : MonoBehaviour
             return;
         }
 
-        #region Resolves issues present in version v0.81 and prior.
-        string homebrewPath = IO.GetFilePath(ContentType.Homebrew);
-        if (File.Exists(homebrewPath))
+
+        Config config;
+        try
         {
-            string homebrewJson = File.ReadAllText(homebrewPath);
-            var content = JsonConvert.DeserializeObject<Games>(homebrewJson);
-            if (content != null && content.DATA != null)
-            {
-                var fpkgiEntry = content.DATA.FirstOrDefault(entry => entry.Value.title_id == "FPKGI13337");
-                if (fpkgiEntry.Value != null)
-                {
-                    string oldKey = fpkgiEntry.Key;
-                    var gameContent = fpkgiEntry.Value;
-                    gameContent.title_id = "PKGI13337";
-
-                    content.DATA.Remove(oldKey);
-                    content.DATA[oldKey] = gameContent;
-
-                    string updatedJson = JsonConvert.SerializeObject(content, Formatting.Indented);
-                    File.WriteAllText(homebrewPath, updatedJson);
-                }
-            }
+            string jsonContent = File.ReadAllText(configPath);
+            config = JsonConvert.DeserializeObject<Config>(jsonContent) ?? new Config();
         }
-        #endregion
-
-        string jsonContent = File.ReadAllText(configPath);
-        var config = JsonConvert.DeserializeObject<Config>(jsonContent) ?? new Config();
+        catch (Exception ex)
+        {
+            string rejectedPath = configPath + ".invalid";
+            File.Copy(configPath, rejectedPath, true);
+            Print(LogType.Error, $"Invalid configuration preserved at {rejectedPath}: {ex.Message}");
+            config = new Config();
+        }
         if (config.filtering == null)
             config.filtering = new ContentFilter();
         if (config.filtering.sort == null)
@@ -273,16 +271,40 @@ public class Background : MonoBehaviour
         filteredRegions = (config.filtering.regions != null) ? config.filtering.regions.Distinct().ToArray() : new string[0];
 
         directDownload = config.preferences.downloads == null || config.preferences.downloads.directDownload;
-        downloadPath = (config.preferences.downloads != null && !string.IsNullOrEmpty(config.preferences.downloads.downloadPath)) ?
-                       config.preferences.downloads.downloadPath : "/user/data/FPKGi/Downloads";
+
+        string defaultDownloadPath = isConsole
+            ? "/user/data/FPKGi/Downloads/"
+            : Path.Combine(directoryPath, "Downloads");
+        string requestedDownloadPath =
+            config.preferences.downloads != null && !string.IsNullOrWhiteSpace(config.preferences.downloads.downloadPath)
+                ? config.preferences.downloads.downloadPath
+                : defaultDownloadPath;
+        try
+        {
+            downloadPath = DownloadPolicy.NormalizeDownloadRoot(requestedDownloadPath, isConsole);
+        }
+        catch (ArgumentException ex)
+        {
+            Print(LogType.Warning, $"Invalid download path '{requestedDownloadPath}': {ex.Message} Using the default.");
+            downloadPath = DownloadPolicy.NormalizeDownloadRoot(defaultDownloadPath, isConsole);
+        }
+
         installAfter = config.preferences.downloads == null || config.preferences.downloads.installAfter;
-        deleteAfter = config.preferences.downloads == null || config.preferences.downloads.deleteAfter;
-        deleteOnCancel = (config.preferences.downloads != null) && config.preferences.downloads.deleteOnCancel;
+        deleteAfter = config.preferences.downloads != null && config.preferences.downloads.deleteAfter;
+        deleteOnCancel = config.preferences.downloads != null && config.preferences.downloads.deleteOnCancel;
+        maxDownloadRetries = config.preferences.downloads == null || config.preferences.downloads.maxRetries <= 0
+            ? 3
+            : Mathf.Clamp(config.preferences.downloads.maxRetries, 1, 10);
+        retryBaseDelaySeconds = config.preferences.downloads == null || config.preferences.downloads.retryBaseDelaySeconds <= 0
+            ? 2
+            : Mathf.Clamp(config.preferences.downloads.retryBaseDelaySeconds, 1, 60);
 
         background_uri = config.preferences.application?.background_uri;
         backgroundMusic = config.preferences.application == null || config.preferences.application.backgroundMusic;
-        enableUpdates = config.preferences.application == null || config.preferences.application.enableUpdates;
-        populateViaWeb = loadedOffline == false && (config.preferences.application != null && config.preferences.application.populateViaWeb);
+        enableUpdates = MaintainedUpdateChannelAvailable &&
+            (config.preferences.application == null || config.preferences.application.enableUpdates);
+        populateViaWeb = config.preferences.application != null &&
+            config.preferences.application.populateViaWeb;
 
         FindObjectOfType<Background>()?.LoadCustomBackground();
 
@@ -371,7 +393,23 @@ public class Background : MonoBehaviour
 
         initializedApp = true;
     }
-    [DllImport("UnityOrbisBridge")] public static extern IntPtr GetDiskInfo(string type, string path);
+    private void FailStartup(string stage, int errorCode = 0)
+    {
+        startupError = errorCode == 0
+            ? $"Startup failed: {stage}"
+            : $"Startup failed: {stage} (0x{errorCode:X8})";
+
+        Print(LogType.Exception, startupError);
+        loadedOffline = true;
+        fullyInitialized = true;
+
+        var statusText = UI.FindInactiveObjectsByPath("Canvas/Main/ContentSort")?.GetComponent<Text>();
+        UI.ChangeText(statusText, startupError);
+        statusText?.gameObject.SetActive(true);
+
+        if (isConsole)
+            UOB.TextNotify(222, startupError);
+    }
 
     public IEnumerator UpdateDisplayInfo()
     {
@@ -407,8 +445,12 @@ public class Background : MonoBehaviour
                     UOB.Temperature.CPU, 55f, 70f);
 
                 if (freeSpaceText != null)
-                    freeSpaceText.text = $"Free: {Marshal.PtrToStringAnsi(GetDiskInfo(mountPoint, "free"))}";
-                //    UpdateDiskInfo(freeSpaceText, UOB.DiskInfo.Free);
+                {
+                    ulong freeBytes = NativeBridge.GetDiskFreeBytes(mountPoint);
+                    freeSpaceText.text = freeBytes == UInt64.MaxValue
+                        ? "Free: Not Available"
+                        : $"Free: {IO.FormatByteString(freeBytes)}";
+                }
 
                 /*
                 string val0 = Marshal.PtrToStringAnsi(GetDiskInfo("/data", "percent"));
@@ -564,41 +606,72 @@ public class Background : MonoBehaviour
 
         if (isConsole)
         {
-            float jbStart = Time.time;
+            float jailbreakStart = Time.realtimeSinceStartup;
             UOB.BreakFromSandbox();
 
-            while (!IO.DoesPathExist("/system/common/lib"))
+            while ((!UOB.IsFreeOfSandbox() || !IO.DoesPathExist("/system/common/lib")) &&
+                   Time.realtimeSinceStartup - jailbreakStart < StartupTimeoutSeconds)
                 yield return null;
+
+            if (!UOB.IsFreeOfSandbox() || !IO.DoesPathExist("/system/common/lib"))
+            {
+                FailStartup("HEN sandbox access was not granted");
+                yield break;
+            }
 
             if (IO.DoesPathExist("/data/UnityOrbisBridge.log"))
                 File.Delete("/data/UnityOrbisBridge.log");
 
             string consoleType = etaHEN == true ? "5" : "4";
-            string fwVersion = Marshal.PtrToStringAnsi(UOB.GetFWVersion()).Replace(" ", "");
-            Print(LogType.Assert, $"Currently running on PlayStation {consoleType} ({fwVersion})");
-            Print(LogType.Assert, $"App has broken from the sandbox in {Time.time - jbStart}s!");
+            IntPtr firmwarePointer = UOB.GetFWVersion();
+            firmwareVersion = firmwarePointer == IntPtr.Zero
+                ? "unknown"
+                : Marshal.PtrToStringAnsi(firmwarePointer).Replace(" ", "");
 
-            int SceAppInstUtil = UOB.SafeLoadModule("/system/common/lib/libSceAppInstUtil.sprx");
-            int SceBgft = UOB.SafeLoadModule("/system/common/lib/libSceBgft.sprx");
-            while (SceAppInstUtil <= 0 || SceBgft <= 0)
-                yield return null;
+            Print(LogType.Assert, $"Currently running on PlayStation {consoleType} ({firmwareVersion})");
+            Print(LogType.Assert, $"App broke from the sandbox in {Time.realtimeSinceStartup - jailbreakStart:F2}s.");
 
-            Print(LogType.Assert, "Successfully loaded necessary SCE libraries...");
+            int initializationResult = NativeBridge.InitializePackageServices();
+            if (initializationResult != 0)
+            {
+                FailStartup("AppInstUtil/BGFT initialization", initializationResult);
+                yield break;
+            }
 
-            UOB.InitializeNativeDialogs();
+            string caBundlePath = Path.Combine(Application.streamingAssetsPath, "cacert.pem");
+            int httpResult = NativeBridge.ConfigureHttp(caBundlePath);
+            if (httpResult != 0)
+            {
+                FailStartup("HTTPS trust store initialization", httpResult);
+                yield break;
+            }
 
-            //   long app_size = GetRemoteFileSize("https://github.com/ItsJokerZz/FPKGi/releases/download/v1.01.1/FPKGi_v1.01.1-release.pkg");
-            //   Print(LogType.Log, $"TEST APP SIZE: {app_size}");
+            Print(LogType.Assert, "Native package services and HTTPS trust store initialized.");
         }
 
         IO.EnsureDirectoryExists(Path.Combine(directoryPath, "Backgrounds"));
         IO.EnsureDirectoryExists(Path.Combine(directoryPath, "ContentJSONs"));
         IO.EnsureDirectoryExists(Path.Combine(directoryPath, "Downloads"));
 
-        for (int i = 0; i < 11; i++)
+        HandleConfiguration();
+        if (!String.IsNullOrEmpty(startupError))
+        {
+            const string prefix = "Startup failed: ";
+            string stage = startupError.StartsWith(prefix, StringComparison.Ordinal)
+                ? startupError.Substring(prefix.Length)
+                : startupError;
+            FailStartup(stage);
+            yield break;
+        }
+
+        IO.EnsureDirectoryExists(downloadPath);
+
+        for (int i = 0; i < (int)ContentType.ALL; i++)
         {
             var task = JSON.ParseJSON((ContentType)i);
             while (!task.IsCompleted) yield return null;
+            if (task.IsFaulted)
+                Print(LogType.Error, $"Failed to load {(ContentType)i}: {task.Exception?.GetBaseException().Message}");
         }
 
         float downloadStart = Time.time;
@@ -614,13 +687,10 @@ public class Background : MonoBehaviour
         if (string.IsNullOrEmpty(result))
         {
             if (isConsole)
-                UOB.TextNotify(222, "Please connect to the internet and or use local connection content!");
+                UOB.TextNotify(222, "Update service unavailable; local and cached catalogs remain available.");
 
-            Print(LogType.Warning, "Loaded offline, toggling \"Populate Via Web\" to prevent hanging...");
-
+            Print(LogType.Warning, "Update service unavailable. Catalog source preferences were not changed.");
             loadedOffline = true;
-            populateViaWeb = false;
-            SaveConfiguration();
         }
         else
             loadedOffline = false;

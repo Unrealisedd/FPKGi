@@ -63,6 +63,8 @@ public enum SortBy
         public bool installAfter { get; set; }
         public bool deleteAfter { get; set; }
         public bool deleteOnCancel { get; set; }
+        public int maxRetries { get; set; }
+        public int retryBaseDelaySeconds { get; set; }
     }
 
     public class Application
@@ -99,6 +101,24 @@ public enum SortBy
         public string size { get; set; }
         public string min_fw { get; set; }
         public string cover_url { get; set; }
+        public string sha256 { get; set; }
+    }
+
+    public class DownloadQueue
+    {
+        public int schema_version { get; set; }
+        public List<DownloadQueueItem> items { get; set; }
+    }
+
+    public class DownloadQueueItem
+    {
+        public string id { get; set; }
+        public string url { get; set; }
+        public GameContent content { get; set; }
+        public string state { get; set; }
+        public int attempts { get; set; }
+        public string last_error { get; set; }
+        public string final_path { get; set; }
     }
 
     public class Games

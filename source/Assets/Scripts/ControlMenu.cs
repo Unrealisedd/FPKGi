@@ -6,7 +6,6 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityOrbisBridge;
@@ -42,7 +41,8 @@ public class ControlMenu : MonoBehaviour
     #endregion
 
     #region Variables
-    private bool menuLoaded = false, isDownloading = false;
+    private bool menuLoaded = false, isDownloading = false, queueLoaded = false;
+    private bool cancelDirectDownloadRequested = false, cancelDirectDownloadSignalSent = false;
 
     public static bool reloadTriggered = false;
 
@@ -52,12 +52,18 @@ public class ControlMenu : MonoBehaviour
     private Coroutine scrollCoroutine;
     private Coroutine downloadCoroutine;
 
-    public string sanitizedFilename;
 
-    public List<string> queueList = new List<string>();
+    public List<DownloadQueueItem> queueList = new List<DownloadQueueItem>();
     private int queueItemsPerPage = 24;
     public int queueCurrentPage = 0;
     public int queueHighlightIndex = 0;
+
+    private sealed class DirectDownloadResult
+    {
+        public bool Succeeded;
+        public bool Cancelled;
+        public string Error;
+    }
     #endregion
 
     #region Coroutine Handling
@@ -78,8 +84,27 @@ public class ControlMenu : MonoBehaviour
         while (loadedOffline == null || !fullyInitialized)
             yield return null;
 
-        HandleConfiguration();
+        if (!String.IsNullOrEmpty(startupError))
+        {
+            queueLoaded = true;
+            Text statusText =
+                UI.FindInactiveObjectsByPath("Canvas/Main/ContentSort")?.GetComponent<Text>();
+            UI.ChangeText(statusText, startupError);
+            statusText?.gameObject.SetActive(true);
+            yield break;
+        }
+
         UpdateSettingsOptions();
+        LoadDownloadQueue();
+        if (!String.IsNullOrEmpty(startupError))
+        {
+            Text statusText =
+                UI.FindInactiveObjectsByPath("Canvas/Main/ContentSort")?.GetComponent<Text>();
+            UI.ChangeText(statusText, startupError);
+            statusText?.gameObject.SetActive(true);
+            yield break;
+        }
+
 
         Background background = FindObjectOfType<Background>();
 
@@ -91,7 +116,7 @@ public class ControlMenu : MonoBehaviour
         if (backgroundMusic)
             audioSource.Play();
 
-        if (enableUpdates)
+        if (MaintainedUpdateChannelAvailable && enableUpdates)
             yield return CheckForAppUpdates();
 
         float elapsed = Time.time - startTime;
@@ -101,574 +126,489 @@ public class ControlMenu : MonoBehaviour
         yield return null;
     }
 
-    private void ResetDownloadState()
+    private void ClearDownloadProgress(bool hideCanvas)
     {
-        if (isConsole)
-            UOB.ResetDownloadVars();
-
-        if (downloadCoroutine != null)
-        {
-            StopCoroutine(downloadCoroutine);
-            downloadCoroutine = null;
-        }
-
         isDownloading = false;
-
-        UI.ShowUIState(null);
+        if (scrollCoroutine != null)
+        {
+            StopCoroutine(scrollCoroutine);
+            scrollCoroutine = null;
+        }
 
         if (downloadCanvas != null)
         {
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/Title")?.GetComponent<Text>(), string.Empty);
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/Elapsed")?.GetComponent<Text>(), string.Empty);
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/WriteSpeed")?.GetComponent<Text>(), string.Empty);
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/Percentage")?.GetComponent<Text>(), string.Empty);
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/RemainingTime")?.GetComponent<Text>(), string.Empty);
+            UI.ChangeText(downloadCanvas.transform.Find("Text/Title")?.GetComponent<Text>(), string.Empty);
+            UI.ChangeText(downloadCanvas.transform.Find("Text/Elapsed")?.GetComponent<Text>(), string.Empty);
+            UI.ChangeText(downloadCanvas.transform.Find("Text/WriteSpeed")?.GetComponent<Text>(), string.Empty);
+            UI.ChangeText(downloadCanvas.transform.Find("Text/Percentage")?.GetComponent<Text>(), string.Empty);
+            UI.ChangeText(downloadCanvas.transform.Find("Text/DownloadSpeed")?.GetComponent<Text>(), string.Empty);
+            UI.ChangeText(downloadCanvas.transform.Find("Text/RemainingTime")?.GetComponent<Text>(), string.Empty);
             UI.FindInactiveObjectsByPath("Canvas/Download/ProgressBar")?.SetActive(false);
+        }
+
+        if (hideCanvas)
+            UI.ShowUIState(null);
+    }
+
+    private void ShowDownloadProgress(DownloadQueueItem item)
+    {
+        Text name = downloadCanvas == null
+            ? null : downloadCanvas.transform.Find("Text/Title")?.GetComponent<Text>();
+        string title = item != null && item.content != null ? item.content.name : string.Empty;
+
+        UI.ChangeText(name, title);
+        if (name != null)
+        {
+            UI.SetFontByText(ref name);
+            name.fontSize = name.font == FindObjectOfType<ContentHandler>()?.Arabic ? 28 : 36;
+
+            if (scrollCoroutine != null)
+                StopCoroutine(scrollCoroutine);
+            scrollCoroutine = StartCoroutine(ScrollText(name, title));
+        }
+
+        UI.ShowUIState(downloadCanvas);
+    }
+
+    private void RenderDownloadProgress(DownloadProgress progress, float elapsedSeconds, ulong writeSpeed)
+    {
+        if (downloadCanvas == null || progress == null) return;
+
+        ulong effectiveSpeed = progress.SpeedBytesPerSecond;
+        if (writeSpeed > 0 && (effectiveSpeed == 0 || writeSpeed < effectiveSpeed))
+            effectiveSpeed = writeSpeed;
+
+        string total = progress.HasKnownTotal ? IO.FormatByteString(progress.TotalBytes) : "unknown";
+        string remaining = progress.HasKnownTotal && effectiveSpeed > 0
+            ? FormatTime((float)((double)progress.RemainingBytes / effectiveSpeed))
+            : "Calculating...";
+
+        UI.ChangeText(downloadCanvas.transform.Find("Text/Elapsed")?.GetComponent<Text>(),
+            $"Elapsed: {FormatTime(elapsedSeconds)}");
+        UI.ChangeText(downloadCanvas.transform.Find("Text/WriteSpeed")?.GetComponent<Text>(),
+            $"Write Speed: {FormatSpeed(writeSpeed)}");
+        UI.ChangeText(downloadCanvas.transform.Find("Text/Percentage")?.GetComponent<Text>(),
+            $"{progress.Percent.ToString("0.##", CultureInfo.InvariantCulture)}%");
+        UI.ChangeText(downloadCanvas.transform.Find("Text/DownloadSpeed")?.GetComponent<Text>(),
+            $"{FormatSpeed(progress.SpeedBytesPerSecond)} - {IO.FormatByteString(progress.CurrentBytes)} of {total}");
+        UI.ChangeText(downloadCanvas.transform.Find("Text/RemainingTime")?.GetComponent<Text>(),
+            $"Remaining: {remaining}");
+
+        RectTransform progressBar =
+            UI.FindInactiveObjectsByPath("Canvas/Download/ProgressBar/Progress")?.GetComponent<RectTransform>();
+        if (progressBar != null)
+        {
+            float amount = (float)(progress.Percent / 100.0);
+            progressBar.pivot = new Vector2(0f, 0.5f);
+            progressBar.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal,
+                Mathf.Lerp(10.55f, 735.64f, amount) - 10.56f);
+            progressBar.anchoredPosition = new Vector2(10.56f, progressBar.anchoredPosition.y);
+            UI.FindInactiveObjectsByPath("Canvas/Download/ProgressBar")?.SetActive(true);
         }
     }
 
-    private IEnumerator UpdateDownloadProgress()
+    private IEnumerator ProcessDirectItem(DownloadQueueItem item, DirectDownloadResult result)
     {
-        bool hasDownloadCompleted = false,
-             downloadErrorOccurred = false;
-
-        string progressPercentage = "0",
-               totalFileSize = "0",
-               downloadedBytes = "0",
-               networkSpeed = "0";
-
-        float lastUpdateTimestamp = Time.time,
-              downloadStartTimestamp = Time.time,
-              lastWriteTimestamp = Time.time,
-
-              smoothedNetworkSpeed = 0f,
-              smoothedWriteSpeed = 0f,
-
-              updateInterval = 0.5f,
-              minUpdateInterval = 0.2f,
-              maxUpdateInterval = 1.5f,
-              ewmaAlpha = 0.25f,
-
-              previousDownloadedBytes = 0f;
-
-        if (isConsole)
-            UOB.ResetDownloadVars();
-
-        isDownloading = true;
-
-        var name = UI.FindInactiveObjectsByPath("Canvas/Download/Text/Title")?.GetComponent<Text>();
-
-        UI.ChangeText(name, currentContentItem.Value.name);
-
-        UI.SetFontByText(ref name);
-        if (name.font == FindObjectOfType<ContentHandler>()?.Arabic)
-            name.fontSize = 28;
-        else name.fontSize = 36;
-
-        UI.ShowUIState(downloadCanvas);
-
-        while (isDownloading && !hasDownloadCompleted)
+        if (TryBlockUnavailableMaintainedUpdate(item))
         {
-            if (isConsole)
-            {
-                if (UOB.HasDownloadErrorOccured())
-                {
-                    downloadErrorOccurred = true;
-                    hasDownloadCompleted = true;
-                }
-
-                if (UOB.HasDownloadCompleted())
-                    hasDownloadCompleted = true;
-
-                float parsedSpeed;
-                float.TryParse(Marshal.PtrToStringAnsi(UOB.GetDownloadInfo("speed")),
-                    NumberStyles.Float, CultureInfo.InvariantCulture, out parsedSpeed);
-
-                networkSpeed = parsedSpeed.ToString("0.##", CultureInfo.InvariantCulture);
-
-                totalFileSize = Marshal.PtrToStringAnsi(UOB.GetDownloadInfo("filesize"));
-                downloadedBytes = Marshal.PtrToStringAnsi(UOB.GetDownloadInfo("downloaded"));
-
-                progressPercentage = Marshal.PtrToStringAnsi(UOB.GetDownloadInfo("progress"));
-                progressPercentage = progressPercentage == int.MinValue.ToString() ? "0" : progressPercentage;
-            }
-
-            if (Time.time - lastUpdateTimestamp >= updateInterval)
-            {
-                float elapsedDownloadTime = Time.time - downloadStartTimestamp;
-
-                ulong downloadedBytesValue;
-                ulong.TryParse(downloadedBytes, out downloadedBytesValue);
-
-                ulong totalFileSizeValue;
-                ulong.TryParse(totalFileSize, out totalFileSizeValue);
-
-                ulong networkSpeedValue;
-                ulong.TryParse(networkSpeed, out networkSpeedValue);
-
-                smoothedNetworkSpeed = smoothedNetworkSpeed == 0
-                    ? networkSpeedValue : (ulong)(ewmaAlpha * networkSpeedValue
-                    + (1 - ewmaAlpha) * smoothedNetworkSpeed);
-
-                updateInterval = smoothedNetworkSpeed > 1024
-                    ? Mathf.Max(minUpdateInterval, updateInterval * 0.95f)
-                    : Mathf.Min(maxUpdateInterval, updateInterval * 1.05f);
-
-                float timeDifference = Mathf.Max(0.1f, Time.time - lastWriteTimestamp);
-                ulong writeSpeed = (ulong)((downloadedBytesValue - previousDownloadedBytes) / timeDifference);
-
-                smoothedWriteSpeed = smoothedWriteSpeed == 0
-                    ? writeSpeed : (ulong)(ewmaAlpha * writeSpeed + (1 - ewmaAlpha) * smoothedWriteSpeed);
-
-                previousDownloadedBytes = downloadedBytesValue;
-
-                lastWriteTimestamp = Time.time;
-
-                ulong remainingBytes = totalFileSizeValue - downloadedBytesValue;
-                float effectiveSpeed = Math.Min(smoothedNetworkSpeed, smoothedWriteSpeed);
-
-                string formattedEstimatedTimeRemaining
-                    = FormatTime(effectiveSpeed > 0 ? remainingBytes / effectiveSpeed : 0);
-
-                float progressAsFloat;
-                float.TryParse(progressPercentage, out progressAsFloat);
-
-                progressAsFloat /= 100f;
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/Elapsed")?.GetComponent<Text>(),
-                    $"Elapsed: {FormatTime(elapsedDownloadTime)}");
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/WriteSpeed")?.GetComponent<Text>(),
-                    $"Write Speed: {FormatSpeed(smoothedWriteSpeed)}");
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/Percentage")?.GetComponent<Text>(),
-                    $"{progressPercentage}%");
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/DownloadSpeed")?.GetComponent<Text>(),
-                    $"{FormatSpeed(smoothedNetworkSpeed)}" +
-                    $" - {IO.FormatByteString(downloadedBytesValue)}" +
-                    $" of {IO.FormatByteString(totalFileSizeValue)}");
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/RemainingTime")?.GetComponent<Text>(),
-                    $"Remaining: {formattedEstimatedTimeRemaining}");
-
-                var progressBar = UI.FindInactiveObjectsByPath("Canvas/Download/ProgressBar/Progress")?.GetComponent<RectTransform>();
-
-                progressBar.pivot = new Vector2(0f, 0.5f);
-                progressBar.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, Mathf.Lerp(10.55f, 735.64f, progressAsFloat) - 10.56f);
-
-                progressBar.anchoredPosition = new Vector2(10.56f, progressBar.anchoredPosition.y);
-                UI.FindInactiveObjectsByPath("Canvas/Download/ProgressBar")?.SetActive(true);
-
-                lastUpdateTimestamp = Time.time;
-            }
-
-            yield return null;
+            result.Error = item.last_error;
+            yield break;
         }
 
-        ResetDownloadState();
-
-        string downloadedFile = $"{downloadPath}[{currentContentItem.Value.title_id}] {sanitizedFilename}";
-
-        if (IO.IsValidZipArchiveFile(downloadedFile + ".pkg"))
+        Uri downloadUri;
+        PackagePaths paths;
+        ulong expectedSize;
+        string expectedSha256;
+        string validationError;
+        if (!TryPrepareQueueItem(item, out downloadUri, out paths, out expectedSize,
+            out expectedSha256, out validationError))
         {
-            string archiveFile = downloadedFile + ".zip";
-            File.Move(downloadedFile + ".pkg", archiveFile);
-            IO.EnsureDirectoryExists(downloadedFile);
-            // UOB.ExtractZipFile(archiveFile, downloadedFile); // - uncomment this
+            FailQueueItem(item, validationError);
+            result.Error = validationError;
+            yield break;
+        }
 
-            if (File.Exists(archiveFile))
-                File.Delete(archiveFile);
-
-            var pkgFiles = Directory.GetFiles(downloadedFile, "*.pkg", SearchOption.AllDirectories)
-                .OrderBy(f =>
-                {
-                    string directory = Path.GetDirectoryName(f);
-                    string dirName = Path.GetFileName(directory);
-                    var dirMatch = Regex.Match(dirName, @"\d+");
-                    return dirMatch.Success ? int.Parse(dirMatch.Value) : int.MaxValue;
-                })
-                .OrderBy(f =>
-                {
-                    string fileName = Path.GetFileNameWithoutExtension(f);
-                    var fileMatch = Regex.Match(fileName, @"\d+");
-                    return fileMatch.Success ? int.Parse(fileMatch.Value) : int.MaxValue;
-                })
-                .ThenBy(f => f).ToList();
-
-            foreach (string pkgFile in pkgFiles)
+        PackageVerification existing = DownloadPolicy.VerifyPackage(
+            paths.FinalPath, expectedSize, expectedSha256);
+        if (File.Exists(paths.FinalPath))
+        {
+            if (!existing.IsValid)
             {
-                bool isValidPackage = IO.IsValidPackageFile(pkgFile);
+                string error =
+                    $"Existing package '{paths.FinalPath}' failed verification: {existing.Error} " +
+                    "Remove or relocate it before retrying; the file was retained for diagnosis.";
+                FailQueueItem(item, error);
+                result.Error = error;
+                yield break;
+            }
 
-                if (!isValidPackage)
+            if (!TryInstallVerifiedPackage(item, paths.FinalPath, out validationError))
+            {
+                if (item.state != "blocked")
+                    FailQueueItem(item, validationError);
+                result.Error = validationError;
+                yield break;
+            }
+
+            result.Succeeded = true;
+            yield break;
+        }
+
+        if (!isConsole)
+        {
+            validationError = "Direct downloads require the console native bridge.";
+            FailQueueItem(item, validationError);
+            result.Error = validationError;
+            yield break;
+        }
+
+        cancelDirectDownloadRequested = false;
+        cancelDirectDownloadSignalSent = false;
+        for (int retryIndex = 0; retryIndex <= maxDownloadRetries; retryIndex++)
+        {
+            ulong resumedBytes = 0;
+            try
+            {
+                if (File.Exists(paths.ResumePath))
+                    resumedBytes = Math.Min((ulong)new FileInfo(paths.ResumePath).Length, expectedSize);
+            }
+            catch (Exception ex)
+            {
+                validationError = $"Could not inspect resume file: {ex.Message}";
+                FailQueueItem(item, validationError);
+                result.Error = validationError;
+                yield break;
+            }
+
+            ulong remainingBytes = expectedSize - resumedBytes;
+            ulong requiredBytes = remainingBytes > ulong.MaxValue - DownloadSpaceReserveBytes
+                ? ulong.MaxValue : remainingBytes + DownloadSpaceReserveBytes;
+            ulong freeBytes = NativeBridge.GetDiskFreeBytes(paths.Root);
+            if (freeBytes == UInt64.MaxValue)
+            {
+                Print(LogType.Warning,
+                    $"Free-space information is unavailable for '{paths.Root}'; continuing download.");
+            }
+            else if (freeBytes < requiredBytes)
+            {
+                validationError =
+                    $"Insufficient free space on '{paths.Root}': {IO.FormatByteString(freeBytes)} available, " +
+                    $"{IO.FormatByteString(requiredBytes)} required including reserve.";
+                FailQueueItem(item, validationError);
+                result.Error = validationError;
+                yield break;
+            }
+
+            item.attempts++;
+            if (!SetQueueState(item, "downloading", null))
+            {
+                validationError =
+                    "Download was not started because its active state could not be persisted.";
+                SetQueueState(item, "blocked", validationError);
+                Print(LogType.Error, validationError);
+                result.Error = validationError;
+                yield break;
+            }
+
+            int startResult = NativeBridge.StartDirectDownload(downloadUri.AbsoluteUri, paths.FinalPath);
+            if (startResult != 0)
+            {
+                NativeBridge.DownloadState failedStartState = NativeBridge.CurrentDownloadState;
+                if (NativeBridge.IsTerminal(failedStartState))
+                {
+                    int failedStartResetResult = NativeBridge.ResetDirectDownload();
+                    if (failedStartResetResult != 0)
+                        Print(LogType.Warning,
+                            $"Native download reset after a failed start returned " +
+                            $"0x{((uint)failedStartResetResult).ToString("X8")}.");
+                }
+
+                validationError =
+                    $"Native download start failed with code 0x{((uint)startResult).ToString("X8")}.";
+                FailQueueItem(item, validationError);
+                result.Error = validationError;
+                yield break;
+            }
+
+            isDownloading = true;
+            ShowDownloadProgress(item);
+            float startedAt = Time.realtimeSinceStartup;
+            float lastProgressAt = startedAt;
+            ulong previousBytes = resumedBytes;
+            NativeBridge.DownloadState state = NativeBridge.CurrentDownloadState;
+
+            while (!NativeBridge.IsTerminal(state))
+            {
+                if (cancelDirectDownloadRequested && !cancelDirectDownloadSignalSent)
+                {
+                    NativeBridge.CancelDirectDownload();
+                    cancelDirectDownloadSignalSent = true;
+                }
+
+                float now = Time.realtimeSinceStartup;
+                ulong currentBytes = NativeBridge.GetDirectDownloadCurrentBytes();
+                ulong totalBytes = NativeBridge.GetDirectDownloadTotalBytes();
+                ulong speed = NativeBridge.GetDirectDownloadSpeedBytesPerSecond();
+                DownloadProgress progress =
+                    DownloadPolicy.ReduceProgress(previousBytes, currentBytes, totalBytes, speed);
+                float interval = Mathf.Max(0.001f, now - lastProgressAt);
+                double calculatedWriteSpeed = progress.DeltaBytes / (double)interval;
+                ulong writeSpeed = calculatedWriteSpeed >= ulong.MaxValue
+                    ? ulong.MaxValue : (ulong)calculatedWriteSpeed;
+                RenderDownloadProgress(progress, now - startedAt, writeSpeed);
+                previousBytes = currentBytes;
+                lastProgressAt = now;
+
+                yield return null;
+                state = NativeBridge.CurrentDownloadState;
+            }
+
+            int nativeError = NativeBridge.GetDirectDownloadErrorCode();
+            int httpStatus = NativeBridge.GetDirectDownloadHttpStatus();
+            int resetResult = NativeBridge.ResetDirectDownload();
+            if (resetResult != 0)
+                Print(LogType.Warning,
+                    $"Native download reset returned 0x{((uint)resetResult).ToString("X8")}.");
+
+            isDownloading = false;
+            ClearDownloadProgress(false);
+
+            if (state == NativeBridge.DownloadState.Cancelled || cancelDirectDownloadRequested)
+            {
+                if (deleteOnCancel && File.Exists(paths.ResumePath))
                 {
                     try
                     {
-                        File.Delete(pkgFile);
-                        Print(LogType.Warning, "Invalid file header, not installing, and deleting...");
+                        File.Delete(paths.ResumePath);
                     }
-                    catch { /* do nothing */ }
+                    catch (Exception ex)
+                    {
+                        Print(LogType.Warning, $"Could not delete resume file '{paths.ResumePath}': {ex.Message}");
+                    }
                 }
 
-                if ((hasDownloadCompleted && !downloadErrorOccurred && isValidPackage) && (isConsole && installAfter))
+                validationError = "Download cancelled by user.";
+                FailQueueItem(item, validationError);
+                result.Cancelled = true;
+                result.Error = validationError;
+                cancelDirectDownloadRequested = false;
+                cancelDirectDownloadSignalSent = false;
+                yield break;
+            }
+
+            if (state == NativeBridge.DownloadState.Succeeded)
+            {
+                PackageVerification verification = DownloadPolicy.VerifyPackage(
+                    paths.FinalPath, expectedSize, expectedSha256);
+                if (!verification.IsValid)
                 {
-                    var cover = URL.ProperFormatUrl(currentContentItem.Value.cover_url);
-                    if (!URL.IsValidURI(cover)) cover = iconPath;
-
-                    Print(LogType.Log, $"Installing package {pkgFile}");
-                    UOB.InstallLocalPackage(pkgFile, currentContentItem.Value.name, cover, deleteAfter);
-                    // UOB.InstallLocalPackage(pkgFile, currentContentItem.Value.name, deleteAfter);
-
-                    if (GoldHEN == true && deleteAfter)
-                        Directory.Delete(downloadedFile);
+                    validationError =
+                        $"Downloaded package verification failed; file retained for diagnosis: {verification.Error}";
+                    FailQueueItem(item, validationError);
+                    result.Error = validationError;
+                    yield break;
                 }
-            }
-        }
-        else
-        {
-            bool isValidPackage = IO.IsValidPackageFile(downloadedFile + ".pkg");
-            if (!isValidPackage)
-            {
-                try
+
+                if (!TryInstallVerifiedPackage(item, paths.FinalPath, out validationError))
                 {
-                    File.Delete(downloadedFile + ".pkg");
-                    Print(LogType.Warning, "Invalid file header, not installing, and deleting...");
-                }
-                catch { /* do nothing */ }
-            }
-
-            if (hasDownloadCompleted && !downloadErrorOccurred && (isConsole && installAfter) && isValidPackage)
-            {
-                var cover = URL.ProperFormatUrl(currentContentItem.Value.cover_url);
-                if (!URL.IsValidURI(cover)) cover = iconPath;
-
-                Print(LogType.Log, $"Installing package [{downloadedFile + ".pkg"}] " +
-                    $"from {downloadPath} & {(deleteAfter ? "deleting file after." : "keeping file.")}");
-                UOB.InstallLocalPackage(downloadedFile + ".pkg", currentContentItem.Value.name, cover, deleteAfter);
-                // UOB.InstallLocalPackage(downloadedFile + ".pkg", currentContentItem.Value.name, deleteAfter);
-            }
-        }
-
-        yield return null;
-    }
-
-    private IEnumerator UpdateDownloadProgressForQueue()
-    {
-        bool hasDownloadCompleted = false,
-             downloadErrorOccurred = false;
-
-        string progressPercentage = "0",
-               totalFileSize = "0",
-               downloadedBytes = "0",
-               networkSpeed = "0";
-
-        float lastUpdateTimestamp = Time.time,
-              downloadStartTimestamp = Time.time,
-              lastWriteTimestamp = Time.time,
-
-              smoothedNetworkSpeed = 0f,
-              smoothedWriteSpeed = 0f,
-
-              updateInterval = 0.5f,
-              minUpdateInterval = 0.2f,
-              maxUpdateInterval = 1.5f,
-              ewmaAlpha = 0.25f,
-
-              previousDownloadedBytes = 0f;
-
-        if (isConsole)
-            UOB.ResetDownloadVars();
-
-        isDownloading = true;
-
-        while (isDownloading && !hasDownloadCompleted)
-        {
-            if (isConsole)
-            {
-                if (UOB.HasDownloadErrorOccured())
-                {
-                    downloadErrorOccurred = true;
-                    hasDownloadCompleted = true;
+                    if (item.state != "blocked")
+                        FailQueueItem(item, validationError);
+                    result.Error = validationError;
+                    yield break;
                 }
 
-                if (UOB.HasDownloadCompleted())
-                    hasDownloadCompleted = true;
-
-                float parsedSpeed;
-                float.TryParse(Marshal.PtrToStringAnsi(UOB.GetDownloadInfo("speed")),
-                    NumberStyles.Float, CultureInfo.InvariantCulture, out parsedSpeed);
-
-                networkSpeed = parsedSpeed.ToString("0.##", CultureInfo.InvariantCulture);
-
-                totalFileSize = Marshal.PtrToStringAnsi(UOB.GetDownloadInfo("filesize"));
-                downloadedBytes = Marshal.PtrToStringAnsi(UOB.GetDownloadInfo("downloaded"));
-
-                progressPercentage = Marshal.PtrToStringAnsi(UOB.GetDownloadInfo("progress"));
-                progressPercentage = progressPercentage == int.MinValue.ToString() ? "0" : progressPercentage;
+                result.Succeeded = true;
+                yield break;
             }
 
-            if (Time.time - lastUpdateTimestamp >= updateInterval)
+            DownloadFailureKind failureKind = httpStatus > 0
+                ? DownloadFailureKind.Http : DownloadFailureKind.Transport;
+            validationError = httpStatus > 0
+                ? $"Download failed with HTTP status {httpStatus}."
+                : $"Download transport failed with code 0x{((uint)nativeError).ToString("X8")}.";
+
+            if (retryIndex < maxDownloadRetries &&
+                DownloadPolicy.ShouldRetry(failureKind, httpStatus))
             {
-                float elapsedDownloadTime = Time.time - downloadStartTimestamp;
-
-                ulong downloadedBytesValue;
-                ulong.TryParse(downloadedBytes, out downloadedBytesValue);
-
-                ulong totalFileSizeValue;
-                ulong.TryParse(totalFileSize, out totalFileSizeValue);
-
-                ulong networkSpeedValue;
-                ulong.TryParse(networkSpeed, out networkSpeedValue);
-
-                smoothedNetworkSpeed = smoothedNetworkSpeed == 0
-                    ? networkSpeedValue : (ulong)(ewmaAlpha * networkSpeedValue
-                    + (1 - ewmaAlpha) * smoothedNetworkSpeed);
-
-                updateInterval = smoothedNetworkSpeed > 1024
-                    ? Mathf.Max(minUpdateInterval, updateInterval * 0.95f)
-                    : Mathf.Min(maxUpdateInterval, updateInterval * 1.05f);
-
-                float timeDifference = Mathf.Max(0.1f, Time.time - lastWriteTimestamp);
-                ulong writeSpeed = (ulong)((downloadedBytesValue - previousDownloadedBytes) / timeDifference);
-
-                smoothedWriteSpeed = smoothedWriteSpeed == 0
-                    ? writeSpeed : (ulong)(ewmaAlpha * writeSpeed + (1 - ewmaAlpha) * smoothedWriteSpeed);
-
-                previousDownloadedBytes = downloadedBytesValue;
-
-                lastWriteTimestamp = Time.time;
-
-                ulong remainingBytes = totalFileSizeValue - downloadedBytesValue;
-                float effectiveSpeed = Math.Min(smoothedNetworkSpeed, smoothedWriteSpeed);
-
-                string formattedEstimatedTimeRemaining
-                    = FormatTime(effectiveSpeed > 0 ? remainingBytes / effectiveSpeed : 0);
-
-                float progressAsFloat;
-                float.TryParse(progressPercentage, out progressAsFloat);
-
-                progressAsFloat /= 100f;
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/Elapsed")?.GetComponent<Text>(),
-                    $"Elapsed: {FormatTime(elapsedDownloadTime)}");
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/WriteSpeed")?.GetComponent<Text>(),
-                    $"Write Speed: {FormatSpeed(smoothedWriteSpeed)}");
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/Percentage")?.GetComponent<Text>(),
-                    $"{progressPercentage}%");
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/DownloadSpeed")?.GetComponent<Text>(),
-                    $"{FormatSpeed(smoothedNetworkSpeed)}" +
-                    $" - {IO.FormatByteString(downloadedBytesValue)}" +
-                    $" of {IO.FormatByteString(totalFileSizeValue)}");
-
-                UI.ChangeText(downloadCanvas.transform.Find("Text/RemainingTime")?.GetComponent<Text>(),
-                    $"Remaining: {formattedEstimatedTimeRemaining}");
-
-                var progressBar = UI.FindInactiveObjectsByPath("Canvas/Download/ProgressBar/Progress")?.GetComponent<RectTransform>();
-
-                progressBar.pivot = new Vector2(0f, 0.5f);
-                progressBar.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, Mathf.Lerp(10.55f, 735.64f, progressAsFloat) - 10.56f);
-
-                progressBar.anchoredPosition = new Vector2(10.56f, progressBar.anchoredPosition.y);
-                UI.FindInactiveObjectsByPath("Canvas/Download/ProgressBar")?.SetActive(true);
-
-                lastUpdateTimestamp = Time.time;
-            }
-
-            yield return null;
-        }
-
-        // Reset download state but don't hide the canvas (let ProcessQueueItems handle that)
-        if (isConsole)
-            UOB.ResetDownloadVars();
-
-        isDownloading = false;
-
-        // Clear download progress text but keep canvas visible
-        if (downloadCanvas != null)
-        {
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/Elapsed")?.GetComponent<Text>(), string.Empty);
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/WriteSpeed")?.GetComponent<Text>(), string.Empty);
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/Percentage")?.GetComponent<Text>(), string.Empty);
-            UI.ChangeText(UI.FindInactiveObjectsByPath("Canvas/Download/Text/RemainingTime")?.GetComponent<Text>(), string.Empty);
-            UI.FindInactiveObjectsByPath("Canvas/Download/ProgressBar")?.SetActive(false);
-        }
-
-        yield return null;
-    }
-
-    private IEnumerator ProcessQueueItems()
-    {
-        if (queueList.Count == 0) yield break;
-
-        // Close queue canvas
-        UI.ShowUIState(null);
-
-        // Create a copy of the queue list to process
-        List<string> itemsToProcess = new List<string>(queueList);
-
-        for (int i = 0; i < itemsToProcess.Count; i++)
-        {
-            string contentUrl = itemsToProcess[i];
-
-            // Find the content item from any available cache
-            KeyValuePair<string, GameContent>? contentItem = null;
-
-            // Search in allContentCache which contains everything
-            if (ContentHandler.allContentCache.ContainsKey(contentUrl))
-            {
-                contentItem = new KeyValuePair<string, GameContent>(contentUrl, ContentHandler.allContentCache[contentUrl]);
-            }
-
-            if (!contentItem.HasValue)
-            {
-                Print(LogType.Warning, $"Could not find content item for URL: {contentUrl}");
+                SetQueueState(item, "retrying", validationError);
+                int delay = DownloadPolicy.GetRetryDelaySeconds(retryIndex, retryBaseDelaySeconds);
+                Print(LogType.Warning,
+                    $"{validationError} Retrying '{item.content.name}' in {delay} seconds.");
+                yield return new WaitForSecondsRealtime(delay);
                 continue;
             }
 
-            var gameContent = contentItem.Value.Value;
+            FailQueueItem(item, validationError);
+            result.Error = validationError;
+            yield break;
+        }
+    }
 
-            // Set up the current content item for the download process
-            currentContentItem = contentItem.Value;
+    private bool TryInstallVerifiedPackage(DownloadQueueItem item, string finalPath, out string error)
+    {
+        error = null;
+        if (!installAfter)
+            return TryPersistQueueCompletion(item, out error);
+        if (!isConsole)
+        {
+            error = "Package installation requires the console native bridge.";
+            return false;
+        }
 
-            // Sanitize filename
-            sanitizedFilename = IO.SanitizeFilename(gameContent.name);
-            if (UI.IsNonEnglish(sanitizedFilename))
-                sanitizedFilename = $"content-{contentOptions[contentFilter]}_{i + 1}";
+        if (!SetQueueState(item, "installing", null))
+        {
+            error = "Package installation was not started because the installing state " +
+                "could not be persisted.";
+            SetQueueState(item, "blocked", error);
+            Print(LogType.Error, error);
+            return false;
+        }
 
-            string packagePath = $"{downloadPath}[{gameContent.title_id}] {sanitizedFilename}.pkg";
+        string cover = URL.ProperFormatUrl(item.content.cover_url);
+        if (!URL.IsValidURI(cover)) cover = iconPath;
 
-            // Check if already downloaded
-            bool isAlreadyDownloaded = File.Exists(packagePath) && IO.IsValidPackageFile(packagePath);
+        int installResult = NativeBridge.InstallLocalPackageResult(
+            finalPath, item.content.name, cover, deleteAfter);
+        if (installResult != 0)
+        {
+            error =
+                $"Local package installation failed with code 0x{((uint)installResult).ToString("X8")}; " +
+                "the verified package was retained.";
+            return false;
+        }
 
-            if (isAlreadyDownloaded)
+        return TryPersistQueueCompletion(item, out error);
+    }
+
+    private bool TryPersistQueueCompletion(DownloadQueueItem item, out string error)
+    {
+        error = null;
+        if (SetQueueState(item, "completed", null))
+            return true;
+
+        error = "Package processing completed, but queue completion could not be persisted. " +
+            "The item was blocked to prevent duplicate installation; verify the installed package " +
+            "before removing and re-adding it.";
+        SetQueueState(item, "blocked", error);
+        Print(LogType.Error, error);
+        return false;
+    }
+
+    private void ProcessBackgroundItem(DownloadQueueItem item)
+    {
+        if (TryBlockUnavailableMaintainedUpdate(item))
+            return;
+
+        Uri downloadUri;
+        PackagePaths paths;
+        ulong expectedSize;
+        string expectedSha256;
+        string error;
+        if (!TryPrepareQueueItem(item, out downloadUri, out paths, out expectedSize,
+            out expectedSha256, out error))
+        {
+            FailQueueItem(item, error);
+            return;
+        }
+
+        if (!isConsole)
+        {
+            FailQueueItem(item, "Background submission requires the console native bridge.");
+            return;
+        }
+
+        item.attempts++;
+        if (!SetQueueState(item, "submitting", null))
+        {
+            error = "Background submission was not started because its intent " +
+                "could not be persisted.";
+            SetQueueState(item, "blocked", error);
+            Print(LogType.Error, error);
+            return;
+        }
+
+        string cover = URL.ProperFormatUrl(item.content.cover_url);
+        if (!URL.IsValidURI(cover)) cover = iconPath;
+        string safeName = DownloadPolicy.SanitizeName(
+            item.content.name, DownloadPolicy.MaximumFileNameUtf8Bytes);
+        string normalizedTitleId = DownloadPolicy.NormalizeTitleId(item.content.title_id);
+        int submitResult = NativeBridge.InstallWebPackageResult(
+            downloadUri.AbsoluteUri, safeName, normalizedTitleId, cover);
+        if (submitResult == 0)
+        {
+            if (!SetQueueState(item, "submitted", null))
             {
-                Print(LogType.Log, $"Package already downloaded: {gameContent.name}");
+                error = "The background service accepted the request, but the submitted state " +
+                    "could not be persisted. The item was blocked to prevent duplicate submission.";
+                SetQueueState(item, "blocked", error);
+                Print(LogType.Error, error);
+                return;
+            }
 
-                // Install directly if installAfter is enabled
-                if (isConsole && installAfter)
-                {
-                    var cover = URL.ProperFormatUrl(currentContentItem.Value.cover_url);
-                    if (!URL.IsValidURI(cover)) cover = iconPath;
+            Print(LogType.Log,
+                $"Submitted '{item.content.name}' to the background package service.");
+        }
+        else
+        {
+            FailQueueItem(item,
+                $"Background package submission failed with code 0x{((uint)submitResult).ToString("X8")}.");
+        }
+    }
 
-                    Print(LogType.Log, $"Installing package [{packagePath}] from {downloadPath} & {(deleteAfter ? "deleting file after." : "keeping file.")}");
-                    UOB.InstallLocalPackage(packagePath, gameContent.name, cover, deleteAfter);
-                    // UOB.InstallLocalPackage(packagePath, gameContent.name, deleteAfter);
-                }
+    private IEnumerator ProcessQueueItems(string onlyItemId = null)
+    {
+        if (queueList.Count == 0)
+        {
+            downloadCoroutine = null;
+            yield break;
+        }
 
-                // Remove from queue after successful installation
-                queueList.Remove(contentUrl);
+        UI.ShowUIState(null);
+        List<string> itemIds = onlyItemId == null
+            ? queueList.Where(item => item != null && IsDispatchableQueueState(item.state))
+                .Select(item => item.id).ToList()
+            : new List<string> { onlyItemId };
 
-                // Update queue display if it's still active
-                if (queueCanvas.activeSelf)
-                {
-                    UpdateQueueDisplay();
-                }
+        for (int i = 0; i < itemIds.Count; i++)
+        {
+            string itemId = itemIds[i];
+            DownloadQueueItem item = queueList.FirstOrDefault(
+                queued => queued != null && String.Equals(queued.id, itemId, StringComparison.Ordinal));
+            if (item == null) continue;
+            if (!IsDispatchableQueueState(item.state))
+            {
+                Print(LogType.Warning,
+                    $"Queue item '{item.content?.name ?? item.id}' is in '{item.state}' state and was not dispatched.");
+                continue;
+            }
+            Print(LogType.Log,
+                $"Processing {i + 1}/{itemIds.Count}: " +
+                $"{(item.content == null ? "invalid queue item" : item.content.name)}");
+
+            if (directDownload)
+            {
+                DirectDownloadResult result = new DirectDownloadResult();
+                yield return StartCoroutine(ProcessDirectItem(item, result));
+                if (result.Succeeded)
+                    RemoveQueueItem(item);
+                if (result.Cancelled)
+                    break;
             }
             else
             {
-                // Download the package
-                var downloadlink = URL.ProperFormatUrl(URL.DecryptBase64(contentUrl));
-                if (!URL.IsValidURI(downloadlink))
-                {
-                    Print(LogType.Error, $"Invalid download URL: {downloadlink}");
-                    continue;
-                }
-
-                Print(LogType.Log, $"Processing {i + 1}/{itemsToProcess.Count}: {gameContent.name}");
-
-                if (directDownload)
-                {
-                    // Direct download mode - download file then install local package
-                    // Show download canvas for progress tracking
-                    UI.ShowUIState(downloadCanvas);
-
-                    // Update download canvas title for current item
-                    var name = UI.FindInactiveObjectsByPath("Canvas/Download/Text/Title")?.GetComponent<Text>();
-                    if (name != null)
-                    {
-                        UI.ChangeText(name, gameContent.name);
-                        UI.SetFontByText(ref name);
-                        if (name.font == FindObjectOfType<ContentHandler>()?.Arabic)
-                            name.fontSize = 28;
-                        else name.fontSize = 36;
-                    }
-
-                    if (isConsole)
-                    {
-                        UOB.DownloadPkgFile(downloadlink, downloadPath, $"[{gameContent.title_id}] {sanitizedFilename}", true, "NULL");
-                    }
-
-                    // Start download progress tracking for queue processing
-                    yield return StartCoroutine(UpdateDownloadProgressForQueue());
-
-                    // Check if download completed successfully
-                    if (File.Exists(packagePath) && IO.IsValidPackageFile(packagePath))
-                    {
-                        Print(LogType.Log, $"Successfully downloaded: {gameContent.name}");
-
-                        // Install if installAfter is enabled
-                        if (isConsole && installAfter)
-                        {
-                            var cover = URL.ProperFormatUrl(currentContentItem.Value.cover_url);
-                            if (!URL.IsValidURI(cover)) cover = iconPath;
-
-                            Print(LogType.Log, $"Installing package [{packagePath}] from {downloadPath} & {(deleteAfter ? "deleting file after." : "keeping file.")}");
-                            UOB.InstallLocalPackage(packagePath, gameContent.name, cover, deleteAfter);
-                            // UOB.InstallLocalPackage(packagePath, gameContent.name, deleteAfter);
-                        }
-
-                        // Remove from queue after successful download
-                        queueList.Remove(contentUrl);
-
-                        // Update queue display if it's still active
-                        if (queueCanvas.activeSelf)
-                        {
-                            UpdateQueueDisplay();
-                        }
-                    }
-                    else
-                    {
-                        Print(LogType.Error, $"Failed to download: {gameContent.name}");
-                    }
-                }
-                else
-                {
-                    // Background download mode - install web package directly
-                    if (isConsole)
-                    {
-                        var cover = URL.ProperFormatUrl(gameContent.cover_url);
-                        if (!URL.IsValidURI(cover)) cover = iconPath;
-                        UOB.InstallWebPackage(downloadlink, sanitizedFilename, gameContent.title_id, cover);
-                        // UOB.InstallWebPackage(downloadlink, sanitizedFilename, gameContent.name);
-
-                        // Remove from queue after calling install web package
-                        queueList.Remove(contentUrl);
-
-                        // Update queue display if it's still active
-                        if (queueCanvas.activeSelf)
-                        {
-                            UpdateQueueDisplay();
-                        }
-                    }
-                }
+                ProcessBackgroundItem(item);
             }
+
+            if (queueCanvas != null && queueCanvas.activeSelf)
+                UpdateQueueDisplay();
         }
 
-        // Clear the queue after processing all items
-        queueList.Clear();
-
-        // Hide download canvas if it was shown (for direct downloads)
-        if (downloadCanvas.activeSelf)
-        {
-            UI.ShowUIState(null);
-        }
-
-        Print(LogType.Log, "Finished processing all queued items");
-
-        yield return null;
+        cancelDirectDownloadRequested = false;
+        cancelDirectDownloadSignalSent = false;
+        ClearDownloadProgress(true);
+        UIManagement.UpdateAllDownloadStatuses();
+        downloadCoroutine = null;
+        Print(LogType.Log, "Finished processing queued items.");
     }
 
     public string FormatTime(float totalSeconds)
@@ -770,40 +710,6 @@ public class ControlMenu : MonoBehaviour
                         {
                             if (URL.IsValidImage(url))
                                 SetImageFromURL(url, ref coverImage);
-                        }
-
-                        if (currentPkg.TitleID.text == "PKGI13337")
-                        {
-                            if (Variables.version != latestVersion)
-                            {
-                                string oldKey = JSON.FindKeyByValue(parsedData, "PKGI13337");
-                                if (oldKey != null)
-                                {
-                                    var pkgiEntry = parsedData[oldKey];
-
-                                    currentContentItem.Value.version = latestVersion.HasValue ? UI.FormatVersion(latestVersion.Value) : UI.FormatVersion(Variables.version);
-                                    currentContentItem.Value.release = await DownloadAsBytes(updateReleaseUrl) ?? "12-25-2024";
-                                    currentContentItem.Value.size = await DownloadAsBytes(updateSizeUrl) ?? "75000000";
-
-                                    GameContent content = pkgiEntry;
-
-                                    string newKey = await DownloadAsBytes(updateDownloadUrl);
-
-                                    parsedData.Remove(oldKey);
-                                    parsedData[newKey] = content;
-
-                                    var output = new
-                                    {
-                                        DATA = new Dictionary<string, GameContent>
-                                        {
-                                            { newKey, content }
-                                        }
-                                    };
-
-                                    string jsonContent = JsonConvert.SerializeObject(output, Formatting.Indented);
-                                    File.WriteAllText(IO.GetFilePath(ContentType.Homebrew), jsonContent);
-                                }
-                            }
                         }
 
                         bool isPS4Content = IsPS4TitleId(currentContentItem.Value.title_id);
@@ -955,24 +861,22 @@ public class ControlMenu : MonoBehaviour
                         {
                             cooldownTimer = inputCooldown;
 
-                            string contentUrl = currentContentItem.Key;
                             string contentName = currentContentItem.Value.name;
+                            DownloadQueueItem candidate = CreateQueueSnapshot(currentContentItem);
+                            DownloadQueueItem existing = candidate == null ? null :
+                                queueList.FirstOrDefault(item => item != null &&
+                                    String.Equals(item.id, candidate.id, StringComparison.Ordinal));
 
-                            // Check if item is in queue list
-                            bool inQueueList = queueList.Contains(contentUrl);
-
-
-                            if (inQueueList)
+                            if (existing != null)
                             {
-                                // Remove from queue
-                                RemoveFromQueueUI(contentUrl);
+                                RemoveQueueItem(existing);
                                 Print(LogType.Log, $"Removed '{contentName}' from queue");
                             }
                             else
                             {
-                                // Add to queue
-                                AddToQueueUI(currentContentItem);
-                                Print(LogType.Log, $"Added '{contentName}' to queue");
+                                DownloadQueueItem added = AddQueueItem(candidate);
+                                if (added != null)
+                                    Print(LogType.Log, $"Added '{contentName}' to queue");
                             }
                         }
 
@@ -1004,44 +908,39 @@ public class ControlMenu : MonoBehaviour
                             bool scrollUp = clampedValue > 0f;
 
                             int totalItems = queueList.Count;
-                            int totalPages = Mathf.CeilToInt((float)totalItems / queueItemsPerPage);
-                            int itemsOnCurrentPage = Mathf.Min(queueItemsPerPage, totalItems - (queueCurrentPage * queueItemsPerPage));
-
-                            if (scrollDown)
+                            if (totalItems == 0)
                             {
-                                queueHighlightIndex++;
-                                if (queueHighlightIndex >= itemsOnCurrentPage)
+                                queueCurrentPage = 0;
+                                queueHighlightIndex = 0;
+                            }
+                            else
+                            {
+                                int totalPages = Mathf.CeilToInt((float)totalItems / queueItemsPerPage);
+                                int itemsOnCurrentPage = Mathf.Min(queueItemsPerPage,
+                                    totalItems - (queueCurrentPage * queueItemsPerPage));
+
+                                if (scrollDown)
                                 {
-                                    // Move to next page
-                                    queueCurrentPage++;
-                                    if (queueCurrentPage >= totalPages)
+                                    queueHighlightIndex++;
+                                    if (queueHighlightIndex >= itemsOnCurrentPage)
                                     {
-                                        queueCurrentPage = 0;
-                                        queueHighlightIndex = 0;
-                                    }
-                                    else
-                                    {
+                                        queueCurrentPage++;
+                                        if (queueCurrentPage >= totalPages)
+                                            queueCurrentPage = 0;
                                         queueHighlightIndex = 0;
                                     }
                                 }
-                            }
-                            else if (scrollUp)
-                            {
-                                queueHighlightIndex--;
-                                if (queueHighlightIndex < 0)
+                                else if (scrollUp)
                                 {
-                                    // Move to previous page
-                                    queueCurrentPage--;
-                                    if (queueCurrentPage < 0)
+                                    queueHighlightIndex--;
+                                    if (queueHighlightIndex < 0)
                                     {
-                                        queueCurrentPage = Mathf.Max(0, totalPages - 1);
-                                        int itemsOnLastPage = Mathf.Min(queueItemsPerPage, totalItems - (queueCurrentPage * queueItemsPerPage));
-                                        queueHighlightIndex = Mathf.Max(0, itemsOnLastPage - 1);
-                                    }
-                                    else
-                                    {
-                                        int itemsOnPrevPage = Mathf.Min(queueItemsPerPage, totalItems - (queueCurrentPage * queueItemsPerPage));
-                                        queueHighlightIndex = Mathf.Max(0, itemsOnPrevPage - 1);
+                                        queueCurrentPage--;
+                                        if (queueCurrentPage < 0)
+                                            queueCurrentPage = totalPages - 1;
+                                        int pageItems = Mathf.Min(queueItemsPerPage,
+                                            totalItems - (queueCurrentPage * queueItemsPerPage));
+                                        queueHighlightIndex = Mathf.Max(0, pageItems - 1);
                                     }
                                 }
                             }
@@ -1064,30 +963,13 @@ public class ControlMenu : MonoBehaviour
 
                             if (actualIndex >= 0 && actualIndex < queueList.Count)
                             {
-                                string contentUrlToRemove = queueList[actualIndex];
+                                DownloadQueueItem itemToRemove = queueList[actualIndex];
+                                string contentName = itemToRemove != null && itemToRemove.content != null
+                                    ? itemToRemove.content.name : "Invalid queue item";
 
-                                // Find the content item to get the name for logging
-                                string contentName = "Unknown";
-
-                                // Search in allContentCache which contains everything
-                                if (ContentHandler.allContentCache.ContainsKey(contentUrlToRemove))
-                                {
-                                    contentName = ContentHandler.allContentCache[contentUrlToRemove].name;
-                                }
-
-                                // Remove from queue
-                                queueList.RemoveAt(actualIndex);
-
-                                // Simple adjustment: if highlight is now out of bounds, move it back
-                                int itemsOnCurrentPage = Mathf.Min(queueItemsPerPage, queueList.Count - (queueCurrentPage * queueItemsPerPage));
-                                if (queueHighlightIndex >= itemsOnCurrentPage)
-                                {
-                                    queueHighlightIndex = Mathf.Max(0, itemsOnCurrentPage - 1);
-                                }
-
+                                RemoveQueueItem(itemToRemove);
+                                ClampQueueSelection();
                                 Print(LogType.Log, $"Removed '{contentName}' from queue");
-
-                                // Update queue display
                                 UpdateQueueDisplay();
                             }
                         }
@@ -1100,6 +982,11 @@ public class ControlMenu : MonoBehaviour
                 // Handle X button press on queue canvas
                 if (queueCanvas.activeSelf)
                 {
+                    if (downloadCoroutine != null)
+                    {
+                        Print(LogType.Warning, "A queue operation is already running.");
+                        return;
+                    }
                     if (queueList.Count > 0)
                     {
                         Print(LogType.Log, $"Starting download and install of {queueList.Count} queued items");
@@ -1113,111 +1000,58 @@ public class ControlMenu : MonoBehaviour
                     }
                 }
 
-                sanitizedFilename =
-                   IO.SanitizeFilename(currentContentItem.Value.name);
-
-                if (UI.IsNonEnglish(sanitizedFilename))
-                    sanitizedFilename = $"content-{contentOptions[contentFilter]}_{contentScroll + 1}";
-
-                string packagePath =
-                    $"{downloadPath}[{currentContentItem.Value.title_id}] {sanitizedFilename}.pkg";
-
                 if (menuLoaded)
                     ExecuteMenuItemAction();
                 else
                 {
                     if (cancelCanvas.activeSelf)
                     {
-                        if (isConsole)
+                        if (isDownloading && isConsole && !cancelDirectDownloadRequested)
                         {
-                            UOB.CancelDownload();
-
-                            if (deleteOnCancel && IO.DoesPathExist($"{packagePath}.resume"))
-                                File.Delete($"{packagePath}.resume");
+                            cancelDirectDownloadRequested = true;
+                            NativeBridge.CancelDirectDownload();
+                            cancelDirectDownloadSignalSent = true;
+                            Print(LogType.Log,
+                                "Cancellation requested; waiting for the native download to stop.");
                         }
-
-                        if (downloadCoroutine != null)
-                        {
-                            StopCoroutine(downloadCoroutine);
-                            downloadCoroutine = null;
-                        }
-
-                        UI.ShowUIState(null);
-
-                        isDownloading = false;
-
                         return;
                     }
 
                     if (updateCanvas.activeSelf)
                     {
-                        if (isConsole)
+                        if (MaintainedUpdateChannelAvailable && isConsole)
                             UOB.UpdateViaHomebrewStore("PKGI13337");
+                        else
+                            Print(LogType.Warning,
+                                "Application updates are unavailable for this maintained build.");
 
                         UI.ShowUIState(null);
-
                         return;
                     }
 
+                    if (downloadCoroutine != null)
+                    {
+                        Print(LogType.Warning, "A queue operation is already running.");
+                        return;
+                    }
                     if (!downloadCanvas.activeSelf)
                     {
                         if (currentPkg.TitleID.text == "PKGI13337")
                         {
-                            await CheckForAppUpdates();
-
-                            return;
-                        }
-
-                        var downloadlink = URL.ProperFormatUrl(URL.DecryptBase64(currentContentItem.Key));
-                        if (!URL.IsValidURI(downloadlink))
-                        {
-                            Print(LogType.Error, $"Invalid download URL: {downloadlink}");
-                            UI.ShowUIState(null);
-                            return;
-                        }
-
-                        if (isConsole)
-                            Print(LogType.Log, $"Attempting to download PKG from: {downloadlink}"); // move to UOB
-
-                        if (directDownload)
-                        {
-                            if (currentPkg.Downloaded.text == "+" || currentPkg.Downloaded.text == "x")
-                            {
-                                var cover = URL.ProperFormatUrl(currentContentItem.Value.cover_url);
-                                if (!URL.IsValidURI(cover)) cover = iconPath;
-
-                                Print(LogType.Log, $"Installing package [{packagePath}] from {downloadPath} & {(deleteAfter ? "deleting file after." : "keeping file.")}");
-                                UOB.InstallLocalPackage(packagePath, currentContentItem.Value.name, cover, deleteAfter);
-                                // UOB.InstallLocalPackage(packagePath, currentContentItem.Value.name, deleteAfter);
-                            }
+                            if (MaintainedUpdateChannelAvailable)
+                                await CheckForAppUpdates();
                             else
-                            {
-                                if (isConsole)
-                                    UOB.DownloadPkgFile(downloadlink, downloadPath, $"[{currentContentItem.Value.title_id}] {sanitizedFilename}", true, "NULL");
-                                Text name = downloadCanvas.transform.Find("Text/Title")?.GetComponent<Text>();
-
-                                downloadCoroutine = StartCoroutine(UpdateDownloadProgress());
-
-                                if (scrollCoroutine != null)
-                                {
-                                    StopCoroutine(scrollCoroutine);
-                                    scrollCoroutine = null;
-                                }
-
-                                scrollCoroutine = StartCoroutine(ScrollText(name, currentContentItem.Value.name));
-                            }
+                                Print(LogType.Warning,
+                                    "Application updates are unavailable for this maintained build.");
+                            return;
                         }
-                        else
-                        {
-                            if (isConsole)
-                            {
-                                var cover = URL.ProperFormatUrl(currentContentItem.Value.cover_url);
-                                if (!URL.IsValidURI(cover)) cover = iconPath;
 
-                                UOB.InstallWebPackage(downloadlink, sanitizedFilename, currentContentItem.Value.title_id, cover);
-                                // UOB.InstallWebPackage(downloadlink, sanitizedFilename, currentContentItem.Value.name);
-                            }
-                        }
+                        DownloadQueueItem selectedItem = AddToQueueUI(currentContentItem);
+                        if (selectedItem == null)
+                            return;
+
+                        Print(LogType.Log, $"Processing '{currentContentItem.Value.name}'.");
+                        downloadCoroutine = StartCoroutine(ProcessQueueItems(selectedItem.id));
                     }
                 }
             }
@@ -1418,7 +1252,11 @@ public class ControlMenu : MonoBehaviour
                     break;
 
                 case 14:
-                    ToggleOption(14, "Enable App Updates", ref enableUpdates);
+                    if (MaintainedUpdateChannelAvailable)
+                        ToggleOption(14, "Enable App Updates", ref enableUpdates);
+                    else
+                        Print(LogType.Warning,
+                            "Application updates are unavailable for this maintained build.");
                     break;
 
                 case 15:
@@ -1561,7 +1399,9 @@ public class ControlMenu : MonoBehaviour
         UI.ChangeText(populateViaWebText, populateViaWeb ? "x Populate Via Web" : "o Populate Via Web");
 
         Text enableAppUpdatesText = UI.FindInactiveObjectsByPath("Canvas/Menu/Text/UserPreferences/EnableAppUpdates")?.GetComponent<Text>();
-        UI.ChangeText(enableAppUpdatesText, enableUpdates ? "x Enable App Updates" : "o Enable App Updates");
+        UI.ChangeText(enableAppUpdatesText, MaintainedUpdateChannelAvailable
+            ? (enableUpdates ? "x Enable App Updates" : "o Enable App Updates")
+            : "- App Updates Unavailable");
 
         Text backgroundMusicText = UI.FindInactiveObjectsByPath("Canvas/Menu/Text/UserPreferences/BackgroundMusic")?.GetComponent<Text>();
         UI.ChangeText(backgroundMusicText, backgroundMusic ? "x Background Music" : "o Background Music");
@@ -1715,45 +1555,681 @@ public class ControlMenu : MonoBehaviour
     #endregion
 
     #region Queue Management
-    private void AddToQueueUI(KeyValuePair<string, GameContent> contentItem)
+    private string GetQueueFilePath()
     {
-        if (queued_pkgs == null || contentItem.Value == null) return;
+        return Path.Combine(directoryPath, "download-queue.json");
+    }
 
-        // Check if this item already exists in the queue list
-        if (queueList.Contains(contentItem.Key)) return;
-
-        // Add to queue list
-        queueList.Add(contentItem.Key);
-
-        // Only update display if queue canvas is active
-        if (queueCanvas.activeSelf)
+    private bool PersistQueue()
+    {
+        DownloadQueue queue = new DownloadQueue
         {
-            UpdateQueueDisplay();
+            schema_version = 1,
+            items = queueList
+        };
+
+        try
+        {
+            IO.WriteAllTextAtomic(GetQueueFilePath(),
+                JsonConvert.SerializeObject(queue, Formatting.Indented));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Print(LogType.Error, $"Could not persist download queue: {ex.Message}");
+            return false;
         }
     }
 
-    private void RemoveFromQueueUI(string contentUrl)
+    private void LoadDownloadQueue()
     {
-        if (queued_pkgs == null) return;
-
-        // Remove from queue list
-        queueList.Remove(contentUrl);
-
-        // Only update display if queue canvas is active
-        if (queueCanvas.activeSelf)
+        queueLoaded = false;
+        string queuePath = GetQueueFilePath();
+        queueList = new List<DownloadQueueItem>();
+        IO.RecoverAtomicFile(queuePath);
+        if (!File.Exists(queuePath) &&
+            AtomicFileRecovery.HasRecoveryArtifacts(queuePath))
         {
-            UpdateQueueDisplay();
+            startupError =
+                "Startup failed: interrupted download queue write could not be recovered. " +
+                "Recovery files were retained.";
+            Print(LogType.Error, startupError);
+            queueLoaded = true;
+            return;
         }
+        if (!File.Exists(queuePath))
+        {
+            if (!PersistQueue())
+                startupError = "Startup failed: the download queue could not be created.";
+            queueLoaded = true;
+            return;
+        }
+
+        try
+        {
+            DownloadQueue queue =
+                JsonConvert.DeserializeObject<DownloadQueue>(File.ReadAllText(queuePath));
+            if (queue == null || queue.schema_version != 1 || queue.items == null)
+                throw new InvalidDataException("The queue schema is missing or unsupported.");
+
+            bool changed = false;
+            List<DownloadQueueItem> invalidItems = new List<DownloadQueueItem>();
+            foreach (DownloadQueueItem item in queue.items)
+            {
+                if (item == null)
+                {
+                    changed = true;
+                    continue;
+                }
+                if (String.IsNullOrEmpty(item.id))
+                {
+                    item.id = CreateInvalidQueueId(item.url, item.content);
+                    changed = true;
+                }
+
+                Uri validatedUri;
+                PackagePaths validatedPaths;
+                ulong validatedSize;
+                string validatedSha256;
+                string validationError;
+                if (!TryValidateQueueItem(item, false, out validatedUri, out validatedPaths,
+                    out validatedSize, out validatedSha256, out validationError))
+                {
+                    MarkQueueItemBlocked(item, validationError);
+                    Print(LogType.Error, validationError);
+                    invalidItems.Add(item);
+                    changed = true;
+                    continue;
+                }
+
+                string normalizedTitleId =
+                    DownloadPolicy.NormalizeTitleId(item.content.title_id);
+                string normalizedSize = validatedSize.ToString(CultureInfo.InvariantCulture);
+                if (!String.Equals(item.url, validatedUri.AbsoluteUri, StringComparison.Ordinal) ||
+                    !String.Equals(item.content.title_id, normalizedTitleId,
+                        StringComparison.Ordinal) ||
+                    !String.Equals(item.content.size, normalizedSize, StringComparison.Ordinal) ||
+                    !String.Equals(item.content.sha256, validatedSha256,
+                        StringComparison.Ordinal) ||
+                    !String.Equals(item.final_path, validatedPaths.FinalPath,
+                        isConsole ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase))
+                    changed = true;
+                item.url = validatedUri.AbsoluteUri;
+                item.content.title_id = normalizedTitleId;
+                item.content.size = normalizedSize;
+                item.content.sha256 = validatedSha256;
+                item.final_path = validatedPaths.FinalPath;
+
+                if (IsUnavailableMaintainedUpdate(item))
+                {
+                    MarkQueueItemBlocked(item, UnavailableMaintainedUpdateError);
+                    changed = true;
+                }
+
+                DownloadQueueItem duplicate = queueList.FirstOrDefault(existing =>
+                    existing != null && !String.IsNullOrEmpty(item.id) &&
+                    String.Equals(existing.id, item.id, StringComparison.Ordinal));
+                if (duplicate != null)
+                {
+                    if (!QueueSnapshotsMatch(duplicate, item))
+                    {
+                        MarkQueueItemBlocked(duplicate, QueueSnapshotConflictError);
+                        Print(LogType.Error, QueueSnapshotConflictError);
+                    }
+                    changed = true;
+                    continue;
+                }
+
+                DownloadQueueItem pathCollision = FindPathCollision(item);
+                if (pathCollision != null)
+                {
+                    changed = true;
+                    string existingHash;
+                    string candidateHash;
+                    ulong existingSize;
+                    ulong candidateSize;
+                    bool sameContent =
+                        TryGetNormalizedHash(pathCollision, out existingHash) &&
+                        TryGetNormalizedHash(item, out candidateHash) &&
+                        String.Equals(existingHash, candidateHash, StringComparison.Ordinal) &&
+                        TryGetExpectedSize(pathCollision, out existingSize) &&
+                        TryGetExpectedSize(item, out candidateSize) &&
+                        existingSize == candidateSize;
+                    if (!sameContent)
+                        LogPathCollision(pathCollision, item);
+                    continue;
+                }
+
+                queueList.Add(item);
+            }
+
+            foreach (DownloadQueueItem invalidItem in invalidItems)
+            {
+                if (!queueList.Any(existing => existing != null &&
+                    String.Equals(existing.id, invalidItem.id, StringComparison.Ordinal)))
+                    queueList.Add(invalidItem);
+            }
+
+            foreach (DownloadQueueItem item in queueList.ToList())
+            {
+                QueueStartupDisposition disposition =
+                    QueueStatePolicy.GetStartupDisposition(item.state);
+                if (disposition == QueueStartupDisposition.RemoveCompleted)
+                {
+                    queueList.Remove(item);
+                    changed = true;
+                    continue;
+                }
+
+                if (disposition == QueueStartupDisposition.BlockUnknownInstall)
+                {
+                    MarkQueueItemBlocked(item,
+                        "The previous session ended while installation status was unknown. " +
+                        "Verify the package on the console, then remove and re-add this item if needed.");
+                    Print(LogType.Warning, item.last_error);
+                    changed = true;
+                    continue;
+                }
+                if (disposition == QueueStartupDisposition.BlockUnknownSubmission)
+                {
+                    MarkQueueItemBlocked(item,
+                        "The previous session ended while background submission status was unknown. " +
+                        "Check PS4 notifications/downloads, then remove and re-add this item if needed.");
+                    Print(LogType.Warning, item.last_error);
+                    changed = true;
+                    continue;
+                }
+
+                if (item.attempts < 0)
+                {
+                    item.attempts = 0;
+                    string repairedState =
+                        QueueStatePolicy.RepairInvalidAttemptState(item.state);
+                    if (!String.Equals(item.state, repairedState, StringComparison.Ordinal))
+                    {
+                        item.state = repairedState;
+                        item.last_error = "Queue attempt count was invalid.";
+                    }
+                    Print(LogType.Warning,
+                        $"Clamped invalid queue attempt count for '{item.id}'.");
+                    changed = true;
+                }
+
+                if (disposition == QueueStartupDisposition.ResetToQueued)
+                {
+                    item.state = "queued";
+                    item.last_error =
+                        "The previous session ended before this download completed.";
+                    changed = true;
+                }
+                else if (disposition == QueueStartupDisposition.FailInvalid)
+                {
+                    item.state = "failed";
+                    item.last_error = "Queue state was invalid.";
+                    changed = true;
+                }
+
+                if (IsUnavailableMaintainedUpdate(item))
+                {
+                    MarkQueueItemBlocked(item, UnavailableMaintainedUpdateError);
+                    Print(LogType.Warning, item.last_error);
+                    changed = true;
+                    continue;
+                }
+
+            }
+
+            if (changed && !PersistQueue())
+            {
+                startupError =
+                    "Startup failed: recovered download queue state could not be persisted.";
+                Print(LogType.Error, startupError);
+            }
+            queueLoaded = true;
+        }
+        catch (Exception ex)
+        {
+            string invalidPath = queuePath + ".invalid";
+            if (File.Exists(invalidPath))
+                invalidPath += "." + DateTime.UtcNow.ToString("yyyyMMddHHmmss",
+                    CultureInfo.InvariantCulture);
+
+            bool preserved = false;
+            try
+            {
+                File.Move(queuePath, invalidPath);
+                preserved = true;
+                Print(LogType.Error,
+                    $"Malformed download queue preserved as '{invalidPath}': {ex.Message}");
+            }
+            catch (Exception moveError)
+            {
+                Print(LogType.Error,
+                    $"Malformed download queue could not be preserved: {moveError.Message}");
+            }
+
+            queueList.Clear();
+            if (!preserved)
+            {
+                startupError =
+                    "Startup failed: malformed download queue could not be preserved.";
+                Print(LogType.Error, startupError);
+                queueLoaded = true;
+                return;
+            }
+
+            if (!PersistQueue())
+            {
+                startupError =
+                    "Startup failed: an empty replacement download queue could not be persisted.";
+                Print(LogType.Error, startupError);
+            }
+            queueLoaded = true;
+        }
+    }
+
+    private static bool IsQueueState(string state)
+    {
+        return QueueStatePolicy.IsKnown(state);
+    }
+
+    private static bool IsDispatchableQueueState(string state)
+    {
+        return QueueStatePolicy.IsDispatchable(state);
+    }
+
+    private const string UnavailableMaintainedUpdateError =
+        "This package targets the maintained application's title ID, but no immutable update " +
+        "channel is configured. The item was blocked to prevent replacement by an unverified build.";
+    private const string QueueSnapshotConflictError =
+        "A queue item with the same stable identity has different immutable metadata. " +
+        "It was blocked; remove it and re-add the corrected entry.";
+
+    private static bool IsUnavailableMaintainedUpdate(DownloadQueueItem item)
+    {
+        if (MaintainedUpdateChannelAvailable || item == null || item.content == null)
+            return false;
+
+        try
+        {
+            return String.Equals(DownloadPolicy.NormalizeTitleId(item.content.title_id),
+                "PKGI13337", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryBlockUnavailableMaintainedUpdate(DownloadQueueItem item)
+    {
+        if (!IsUnavailableMaintainedUpdate(item))
+            return false;
+
+        MarkQueueItemBlocked(item, UnavailableMaintainedUpdateError);
+        Print(LogType.Warning, UnavailableMaintainedUpdateError);
+        PersistQueue();
+        if (queueCanvas != null && queueCanvas.activeSelf)
+            UpdateQueueDisplay();
+        return true;
+    }
+
+    private static void MarkQueueItemBlocked(DownloadQueueItem item, string error)
+    {
+        if (item == null) return;
+        item.state = "blocked";
+        item.last_error = error;
+    }
+
+
+    private DownloadQueueItem CreateQueueSnapshot(KeyValuePair<string, GameContent> contentItem)
+    {
+        if (contentItem.Value == null) return null;
+
+        GameContent content = new GameContent
+        {
+            title_id = contentItem.Value.title_id,
+            region = contentItem.Value.region,
+            name = contentItem.Value.name,
+            version = contentItem.Value.version,
+            release = contentItem.Value.release,
+            size = contentItem.Value.size,
+            min_fw = contentItem.Value.min_fw,
+            cover_url = contentItem.Value.cover_url,
+            sha256 = contentItem.Value.sha256
+        };
+
+        string source = contentItem.Key;
+        DownloadQueueItem item = new DownloadQueueItem
+        {
+            url = source,
+            content = content,
+            state = "queued",
+            attempts = 0
+        };
+
+        try
+        {
+            source = URL.ProperFormatUrl(URL.DecryptBase64(contentItem.Key));
+            item.url = source;
+            Uri uri = DownloadPolicy.NormalizeDownloadUrl(source);
+            DownloadPolicy.ParseExpectedSize(content.size);
+            content.sha256 = DownloadPolicy.NormalizeSha256(content.sha256);
+            PackagePaths paths = DownloadPolicy.BuildPackagePaths(
+                downloadPath, isConsole, content.title_id, content.version, content.name);
+            item.url = uri.AbsoluteUri;
+            item.id = DownloadPolicy.CreateStableQueueId(
+                item.url, content.title_id, content.version);
+            item.final_path = paths.FinalPath;
+            if (IsUnavailableMaintainedUpdate(item))
+                MarkQueueItemBlocked(item, UnavailableMaintainedUpdateError);
+        }
+        catch (Exception ex)
+        {
+            item.id = CreateInvalidQueueId(source, content);
+            item.state = "failed";
+            item.last_error = $"Invalid queue metadata: {ex.Message}";
+            Print(LogType.Error, item.last_error);
+        }
+
+        return item;
+    }
+
+    private static string CreateInvalidQueueId(string source, GameContent content)
+    {
+        string material = (source ?? string.Empty) + "\n" +
+            (content == null ? string.Empty : content.title_id ?? string.Empty) + "\n" +
+            (content == null ? string.Empty : content.version ?? string.Empty) + "\n" +
+            (content == null ? string.Empty : content.name ?? string.Empty) + "\n" +
+            (content == null ? string.Empty : content.size ?? string.Empty) + "\n" +
+            (content == null ? string.Empty : content.sha256 ?? string.Empty);
+        string failureUrl = "https://invalid.invalid/?metadata=" + Uri.EscapeDataString(material);
+        return DownloadPolicy.CreateStableQueueId(failureUrl, "INVALID", "INVALID");
+    }
+
+    private DownloadQueueItem AddToQueueUI(KeyValuePair<string, GameContent> contentItem)
+    {
+        return AddQueueItem(CreateQueueSnapshot(contentItem));
+    }
+
+    private DownloadQueueItem AddQueueItem(DownloadQueueItem candidate)
+    {
+        if (candidate == null) return null;
+
+        DownloadQueueItem existing = queueList.FirstOrDefault(item => item != null &&
+            String.Equals(item.id, candidate.id, StringComparison.Ordinal));
+        if (existing != null)
+        {
+            if (QueueSnapshotsMatch(existing, candidate))
+                return existing;
+
+            MarkQueueItemBlocked(existing, QueueSnapshotConflictError);
+            Print(LogType.Error, QueueSnapshotConflictError);
+            PersistQueue();
+            if (queueCanvas != null && queueCanvas.activeSelf)
+                UpdateQueueDisplay();
+            return null;
+        }
+
+        DownloadQueueItem pathCollision = FindPathCollision(candidate);
+        if (pathCollision != null)
+        {
+            string existingHash;
+            string candidateHash;
+            ulong existingSize;
+            ulong candidateSize;
+            bool sameContent =
+                TryGetNormalizedHash(pathCollision, out existingHash) &&
+                TryGetNormalizedHash(candidate, out candidateHash) &&
+                String.Equals(existingHash, candidateHash, StringComparison.Ordinal) &&
+                TryGetExpectedSize(pathCollision, out existingSize) &&
+                TryGetExpectedSize(candidate, out candidateSize) &&
+                existingSize == candidateSize;
+            if (sameContent)
+                return pathCollision;
+
+            LogPathCollision(pathCollision, candidate);
+            return null;
+        }
+
+        queueList.Add(candidate);
+        if (!PersistQueue())
+        {
+            queueList.Remove(candidate);
+            Print(LogType.Error,
+                "Queue item was not added because its metadata could not be persisted.");
+            if (queueCanvas != null && queueCanvas.activeSelf)
+                UpdateQueueDisplay();
+            return null;
+        }
+        if (queueCanvas != null && queueCanvas.activeSelf)
+            UpdateQueueDisplay();
+        return candidate;
+    }
+
+    private bool QueueSnapshotsMatch(DownloadQueueItem existing, DownloadQueueItem candidate)
+    {
+        if (existing == null || candidate == null ||
+            existing.content == null || candidate.content == null ||
+            !String.Equals(existing.id, candidate.id, StringComparison.Ordinal) ||
+            !String.Equals(existing.content.name, candidate.content.name,
+                StringComparison.Ordinal))
+            return false;
+
+        try
+        {
+            Uri existingUri = DownloadPolicy.NormalizeDownloadUrl(existing.url);
+            Uri candidateUri = DownloadPolicy.NormalizeDownloadUrl(candidate.url);
+            if (!String.Equals(existingUri.AbsoluteUri, candidateUri.AbsoluteUri,
+                    StringComparison.Ordinal) ||
+                !String.Equals(
+                    DownloadPolicy.NormalizeTitleId(existing.content.title_id),
+                    DownloadPolicy.NormalizeTitleId(candidate.content.title_id),
+                    StringComparison.Ordinal))
+                return false;
+
+            string existingId = DownloadPolicy.CreateStableQueueId(existingUri.AbsoluteUri,
+                existing.content.title_id, existing.content.version);
+            string candidateId = DownloadPolicy.CreateStableQueueId(candidateUri.AbsoluteUri,
+                candidate.content.title_id, candidate.content.version);
+            if (!String.Equals(existing.id, existingId, StringComparison.Ordinal) ||
+                !String.Equals(candidate.id, candidateId, StringComparison.Ordinal))
+                return false;
+        }
+        catch
+        {
+            return false;
+        }
+
+        ulong existingSize;
+        ulong candidateSize;
+        if (!TryGetExpectedSize(existing, out existingSize) ||
+            !TryGetExpectedSize(candidate, out candidateSize) ||
+            existingSize != candidateSize)
+            return false;
+
+        string existingHash;
+        string candidateHash;
+        if (!TryGetOptionalNormalizedHash(existing, out existingHash) ||
+            !TryGetOptionalNormalizedHash(candidate, out candidateHash) ||
+            !String.Equals(existingHash, candidateHash, StringComparison.Ordinal))
+            return false;
+
+        StringComparison pathComparison = isConsole
+            ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+        return !String.IsNullOrEmpty(existing.final_path) &&
+               !String.IsNullOrEmpty(candidate.final_path) &&
+               String.Equals(existing.final_path, candidate.final_path, pathComparison);
+    }
+
+    private DownloadQueueItem FindPathCollision(DownloadQueueItem candidate)
+    {
+        if (candidate == null || String.IsNullOrEmpty(candidate.final_path)) return null;
+        StringComparison comparison = isConsole
+            ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+        return queueList.FirstOrDefault(item => item != null &&
+            !String.IsNullOrEmpty(item.final_path) &&
+            String.Equals(item.final_path, candidate.final_path, comparison));
+    }
+
+    private static bool TryGetNormalizedHash(DownloadQueueItem item, out string hash)
+    {
+        hash = null;
+        if (item == null || item.content == null ||
+            String.IsNullOrWhiteSpace(item.content.sha256))
+            return false;
+        try
+        {
+            hash = DownloadPolicy.NormalizeSha256(item.content.sha256);
+            return hash != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetOptionalNormalizedHash(
+        DownloadQueueItem item, out string hash)
+    {
+        hash = null;
+        if (item == null || item.content == null)
+            return false;
+
+        try
+        {
+            hash = DownloadPolicy.NormalizeSha256(item.content.sha256);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetExpectedSize(DownloadQueueItem item, out ulong size)
+    {
+        size = 0;
+        if (item == null || item.content == null) return false;
+        try
+        {
+            size = DownloadPolicy.ParseExpectedSize(item.content.size);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void LogPathCollision(
+        DownloadQueueItem existing, DownloadQueueItem candidate)
+    {
+        string existingName = existing != null && existing.content != null
+            ? existing.content.name : "existing queue item";
+        string path = candidate == null ? null : candidate.final_path;
+        Print(LogType.Error,
+            $"Destination collision at '{path}' with '{existingName}'. " +
+            "Remove the existing queue item or correct the package metadata before retrying.");
+    }
+
+    private bool TryPrepareQueueItem(DownloadQueueItem item, out Uri uri,
+        out PackagePaths paths, out ulong expectedSize, out string expectedSha256,
+        out string error)
+    {
+        return TryValidateQueueItem(item, true, out uri, out paths, out expectedSize,
+            out expectedSha256, out error);
+    }
+
+    private bool TryValidateQueueItem(DownloadQueueItem item,
+        bool rejectUnavailableMaintainedUpdate, out Uri uri, out PackagePaths paths,
+        out ulong expectedSize, out string expectedSha256, out string error)
+    {
+        uri = null;
+        paths = null;
+        expectedSize = 0;
+        expectedSha256 = null;
+        error = null;
+
+        try
+        {
+            if (item == null || item.content == null)
+                throw new ArgumentException("Queue content snapshot is missing.");
+            if (rejectUnavailableMaintainedUpdate && IsUnavailableMaintainedUpdate(item))
+                throw new InvalidOperationException(UnavailableMaintainedUpdateError);
+
+            uri = DownloadPolicy.NormalizeDownloadUrl(item.url);
+            expectedSize = DownloadPolicy.ParseExpectedSize(item.content.size);
+            expectedSha256 = DownloadPolicy.NormalizeSha256(item.content.sha256);
+            paths = DownloadPolicy.BuildPackagePaths(downloadPath, isConsole,
+                item.content.title_id, item.content.version, item.content.name);
+            string expectedId = DownloadPolicy.CreateStableQueueId(
+                uri.AbsoluteUri, item.content.title_id, item.content.version);
+            if (!String.Equals(item.id, expectedId, StringComparison.Ordinal))
+                throw new ArgumentException("Queue identity does not match its metadata snapshot.");
+
+            StringComparison comparison = isConsole
+                ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            if (!String.Equals(item.final_path, paths.FinalPath, comparison))
+                throw new ArgumentException(
+                    "Stored package path is outside the selected download destination.");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Invalid queue item: {ex.Message}";
+            return false;
+        }
+    }
+
+    private bool SetQueueState(DownloadQueueItem item, string state, string error)
+    {
+        if (item == null) return false;
+        item.state = IsQueueState(state) ? state : "failed";
+        item.last_error = error;
+        bool persisted = PersistQueue();
+        if (queueCanvas != null && queueCanvas.activeSelf)
+            UpdateQueueDisplay();
+        return persisted;
+    }
+
+    private void FailQueueItem(DownloadQueueItem item, string error)
+    {
+        Print(LogType.Error, error);
+        SetQueueState(item, "failed", error);
+    }
+
+    private void RemoveQueueItem(DownloadQueueItem item)
+    {
+        if (item == null) return;
+        queueList.Remove(item);
+        ClampQueueSelection();
+        PersistQueue();
+    }
+
+    private void ClampQueueSelection()
+    {
+        if (queueList.Count == 0)
+        {
+            queueCurrentPage = 0;
+            queueHighlightIndex = 0;
+            return;
+        }
+
+        int totalPages = Mathf.CeilToInt((float)queueList.Count / queueItemsPerPage);
+        queueCurrentPage = Mathf.Clamp(queueCurrentPage, 0, totalPages - 1);
+        int pageItems = Mathf.Min(queueItemsPerPage,
+            queueList.Count - queueCurrentPage * queueItemsPerPage);
+        queueHighlightIndex = Mathf.Clamp(queueHighlightIndex, 0, pageItems - 1);
     }
 
     public void ClearQueueUI()
     {
-        if (queued_pkgs == null) return;
-
-        // Clear queue list
         queueList.Clear();
-
-        // Update queue display
+        queueCurrentPage = 0;
+        queueHighlightIndex = 0;
+        PersistQueue();
         UpdateQueueDisplay();
     }
 
@@ -1761,191 +2237,87 @@ public class ControlMenu : MonoBehaviour
     {
         if (queued_pkgs == null) return;
 
-        // Clear all existing queue items (PKG1-24)
         for (int i = queued_pkgs.transform.childCount - 1; i >= 0; i--)
         {
             Transform child = queued_pkgs.transform.GetChild(i);
             if (child.name.StartsWith("PKG"))
-            {
                 DestroyImmediate(child.gameObject);
-            }
         }
 
-        // Calculate pagination
-        int totalItems = queueList.Count;
-        int totalPages = Mathf.CeilToInt((float)totalItems / queueItemsPerPage);
-        queueCurrentPage = Mathf.Clamp(queueCurrentPage, 0, Mathf.Max(0, totalPages - 1));
-
-        // Reset highlight index if it's out of bounds
-        int itemsOnCurrentPage = Mathf.Min(queueItemsPerPage, totalItems - (queueCurrentPage * queueItemsPerPage));
-        queueHighlightIndex = Mathf.Clamp(queueHighlightIndex, 0, Mathf.Max(0, itemsOnCurrentPage - 1));
-
+        ClampQueueSelection();
         int startIndex = queueCurrentPage * queueItemsPerPage;
-        int endIndex = Mathf.Min(startIndex + queueItemsPerPage, totalItems);
-
-        // Find the Background component to get the prefab
-        Background background = FindObjectOfType<Background>();
-        if (background == null || background.prefab == null) return;
-
-        // Display items for current page
+        int endIndex = Mathf.Min(startIndex + queueItemsPerPage, queueList.Count);
         for (int i = startIndex; i < endIndex; i++)
-        {
-            string contentUrl = queueList[i];
-
-            // Find the content item from any available cache
-            KeyValuePair<string, GameContent>? contentItem = null;
-
-            // Search in allContentCache which contains everything
-            if (ContentHandler.allContentCache.ContainsKey(contentUrl))
-            {
-                contentItem = new KeyValuePair<string, GameContent>(contentUrl, ContentHandler.allContentCache[contentUrl]);
-            }
-
-            if (contentItem.HasValue)
-            {
-                CreateQueueItem(contentItem.Value, i - startIndex);
-            }
-        }
+            CreateQueueItem(queueList[i], i - startIndex);
     }
 
-    private void CreateQueueItem(KeyValuePair<string, GameContent> contentItem, int displayIndex)
+    private void CreateQueueItem(DownloadQueueItem item, int displayIndex)
     {
-        if (queued_pkgs == null || contentItem.Value == null) return;
+        if (queued_pkgs == null || item == null) return;
 
-        // Find the Background component to get the prefab
         Background background = FindObjectOfType<Background>();
         if (background == null || background.prefab == null) return;
 
-        // Instantiate the prefab as a child of queued_pkgs
         GameObject queueItem = Instantiate(background.prefab, queued_pkgs.transform);
         queueItem.name = $"PKG{displayIndex + 1}";
-
-        // Position the item (similar to how main content is positioned)
         RectTransform rectTransform = queueItem.GetComponent<RectTransform>();
         if (rectTransform != null)
         {
             const float spacing = 32f;
             const float offset = -12f;
             Vector2 startPosition = new Vector2(0, queueItemsPerPage * spacing / 2);
-            Vector2 position = startPosition - new Vector2(0, displayIndex * spacing - offset);
-            rectTransform.anchoredPosition = position;
+            rectTransform.anchoredPosition =
+                startPosition - new Vector2(0, displayIndex * spacing - offset);
         }
 
-        // Find the text components in the instantiated prefab
+        GameContent content = item.content;
         Transform titleIdTransform = queueItem.transform.Find("TitleID");
         Transform regionTransform = queueItem.transform.Find("Region");
         Transform titleTransform = queueItem.transform.Find("Title");
         Transform sizeTransform = queueItem.transform.Find("Size");
         Transform downloadedTransform = queueItem.transform.Find("Downloaded");
 
-        if (titleIdTransform != null)
+        Text titleIdText = titleIdTransform == null ? null : titleIdTransform.GetComponent<Text>();
+        Text regionText = regionTransform == null ? null : regionTransform.GetComponent<Text>();
+        Text titleText = titleTransform == null ? null : titleTransform.GetComponent<Text>();
+        Text sizeText = sizeTransform == null ? null : sizeTransform.GetComponent<Text>();
+        Text stateText = downloadedTransform == null ? null : downloadedTransform.GetComponent<Text>();
+
+        UI.ChangeText(titleIdText, content == null || String.IsNullOrEmpty(content.title_id)
+            ? "INVALID" : content.title_id);
+        UI.ChangeText(regionText, content == null ? "???" : content.region ?? "???");
+        UI.ChangeText(titleText, content == null || String.IsNullOrEmpty(content.name)
+            ? "Invalid queue item" : content.name);
+        if (titleText != null)
+            UI.SetFontByText(ref titleText);
+        string formattedSize = "invalid";
+        if (content != null)
         {
-            Text titleIdText = titleIdTransform.GetComponent<Text>();
-            if (titleIdText != null)
+            try
             {
-                UI.ChangeText(titleIdText, contentItem.Value.title_id);
-                // Shift TitleID to the right
-                RectTransform titleIdRect = titleIdTransform.GetComponent<RectTransform>();
-                if (titleIdRect != null)
-                {
-                    Vector2 currentPos = titleIdRect.anchoredPosition;
-                    titleIdRect.anchoredPosition = new Vector2(currentPos.x + 30, currentPos.y);
-                }
+                formattedSize = IO.FormatByteString(
+                    DownloadPolicy.ParseExpectedSize(content.size));
             }
+            catch (ArgumentException) { }
+        }
+        UI.ChangeText(sizeText, formattedSize);
+        if (sizeText != null)
+            sizeText.gameObject.SetActive(true);
+
+        string state = IsQueueState(item.state) ? item.state : "failed";
+        UI.ChangeText(stateText, state);
+        if (stateText != null)
+        {
+            stateText.gameObject.SetActive(true);
+            stateText.color = state == "failed" || state == "blocked" ? redish :
+                state == "submitted" || state == "completed" ? blueish : yellowish;
         }
 
-        if (regionTransform != null)
-        {
-            Text regionText = regionTransform.GetComponent<Text>();
-            if (regionText != null)
-            {
-                UI.ChangeText(regionText, contentItem.Value.region ?? "???");
-                // Shift Region to the right
-                RectTransform regionRect = regionTransform.GetComponent<RectTransform>();
-                if (regionRect != null)
-                {
-                    Vector2 currentPos = regionRect.anchoredPosition;
-                    regionRect.anchoredPosition = new Vector2(currentPos.x + 30, currentPos.y);
-                }
-            }
-        }
-
-        if (titleTransform != null)
-        {
-            Text titleText = titleTransform.GetComponent<Text>();
-            if (titleText != null)
-            {
-                UI.ChangeText(titleText, contentItem.Value.name);
-                UI.SetFontByText(ref titleText);
-                // Shift Title to the right
-                RectTransform titleRect = titleTransform.GetComponent<RectTransform>();
-                if (titleRect != null)
-                {
-                    Vector2 currentPos = titleRect.anchoredPosition;
-                    titleRect.anchoredPosition = new Vector2(currentPos.x + 30, currentPos.y);
-                }
-            }
-        }
-
-        if (sizeTransform != null)
-        {
-            Text sizeText = sizeTransform.GetComponent<Text>();
-            if (sizeText != null)
-            {
-                UI.ChangeText(sizeText, IO.FormatByteString(contentItem.Value.size));
-                sizeText.gameObject.SetActive(true);
-                // Shift Downloaded to the right
-                RectTransform sizeRect = sizeTransform.GetComponent<RectTransform>();
-                if (sizeRect != null)
-                {
-                    Vector2 currentPos = sizeRect.anchoredPosition;
-                    sizeRect.anchoredPosition = new Vector2(currentPos.x - 40, currentPos.y);
-                }
-            }
-
-
-            // Size is NOT shifted to the right as requested
-        }
-
-        if (downloadedTransform != null)
-        {
-            Text downloadedText = downloadedTransform.GetComponent<Text>();
-            if (downloadedText != null)
-            {
-                UI.ChangeText(downloadedText, "");
-                downloadedText.gameObject.SetActive(false);
-                // Shift Downloaded to the right
-                RectTransform downloadedRect = downloadedTransform.GetComponent<RectTransform>();
-                if (downloadedRect != null)
-                {
-                    Vector2 currentPos = downloadedRect.anchoredPosition;
-                    downloadedRect.anchoredPosition = new Vector2(currentPos.x + 30, currentPos.y);
-                }
-            }
-        }
-
-        // Set the color based on highlighting
-        Color itemColor = (displayIndex == queueHighlightIndex) ? blueish : Color.white;
-        if (titleIdTransform != null)
-        {
-            Text titleIdText = titleIdTransform.GetComponent<Text>();
-            if (titleIdText != null) titleIdText.color = itemColor;
-        }
-        if (regionTransform != null)
-        {
-            Text regionText = regionTransform.GetComponent<Text>();
-            if (regionText != null) regionText.color = itemColor;
-        }
-        if (titleTransform != null)
-        {
-            Text titleText = titleTransform.GetComponent<Text>();
-            if (titleText != null) titleText.color = itemColor;
-        }
-        if (sizeTransform != null)
-        {
-            Text sizeText = sizeTransform.GetComponent<Text>();
-            if (sizeText != null) sizeText.color = itemColor;
-        }
+        Color itemColor = displayIndex == queueHighlightIndex ? blueish : Color.white;
+        if (titleIdText != null) titleIdText.color = itemColor;
+        if (regionText != null) regionText.color = itemColor;
+        if (titleText != null) titleText.color = itemColor;
+        if (sizeText != null) sizeText.color = itemColor;
     }
     #endregion
 
@@ -1955,8 +2327,10 @@ public class ControlMenu : MonoBehaviour
 
         StartCoroutine(InitializeCoroutine());
 
-        while (!fullyInitialized)
+        while (!fullyInitialized || !queueLoaded)
             yield return null;
+        if (!String.IsNullOrEmpty(startupError))
+            yield break;
 
         while (true)
         {
